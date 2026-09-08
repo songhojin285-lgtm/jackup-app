@@ -1,0 +1,50 @@
+# app.py 배포용 의존성 (2026-09-08)
+# Windows / Python 3.11 또는 3.12 환경을 기준으로 설치하세요.
+# 이 파일을 app.py와 같은 폴더에 놓고 PowerShell에서 실행:
+#   py -3.12 -m venv .venv
+#   .\.venv\Scripts\python.exe -m pip install --upgrade pip
+#   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+#   .\.venv\Scripts\python.exe -m streamlit run app.py
+# Python 3.11을 설치했다면 첫 명령의 -3.12를 -3.11로 바꾸세요.
+# 이후 실행은 마지막 명령만 사용하면 됩니다. 종료: Ctrl+C.
+#
+# 별도 준비:
+# - Chrome 또는 Edge: Selenium 자동수집에 사용. 최초 드라이버 준비에는 인터넷 필요.
+# - 공공데이터포털 API Key: ASOS 일자료/시간자료에 접근 가능한 키를 앱에 입력.
+# - PDF 방식 사용 시 분석할 장기파랑 PDF 준비.
+# - 로컬 CSV 방식 사용 시 hourly_wind.csv 등 해당 자료파일 준비.
+# - 한글 표시에는 Windows의 맑은 고딕 등 한글 폰트 필요.
+# - 엑셀 서식은 app.py에 내장되어 있어 별도 템플릿 불필요.
+# - 캐시 폴더는 앱이 생성하므로 폴더 쓰기 권한과 자료 저장공간 필요.
+# - Excel/AutoCAD는 파일 생성에 필요하지 않으며 결과 확인에 사용.
+#
+# 현재 app.py의 import 및 간접 의존성을 점검한 설치 목록입니다.
+# 새 PC에서 전체 API/브라우저 기능을 실행 검증한 잠금파일은 아닙니다.
+# 배포 PC에서 정상 실행을 확인한 후 동일 환경을 고정하려면:
+#   .\.venv\Scripts\python.exe -m pip freeze > requirements-lock.txt
+#
+# UI (download_button의 on_click="ignore" 지원 버전 사용)
+# https://docs.streamlit.io/develop/api-reference/widgets/st.download_button
+streamlit>=1.44,<2
+
+# 데이터 처리 및 표 스타일
+pandas>=2.2,<3
+numpy>=1.26,<3
+Jinja2>=3.1,<4
+
+# 바람장미도 미리보기 및 DXF
+matplotlib>=3.8,<4
+ezdxf>=1.3,<2
+
+# XLSX 생성/읽기 및 구형 XLS 읽기
+openpyxl>=3.1,<4
+xlrd>=2.0.1,<3
+
+# API 및 웹 자동수집
+requests>=2.31,<3
+selenium>=4.20,<5
+
+# WINK 압축자료 및 PDF 판독
+py7zr>=0.22,<2
+pypdf>=4,<7
+pdfplumber>=0.11,<1
