@@ -4,7 +4,7 @@ Streamlit 종합 작업가능일수 산정 시스템
 
 핵심 변경사항
 - 기상청 API Hub(getMmSumry2) 사용 제거
-- 안개일수/뇌전일수/결빙일수는 기상자료개방포털 실제 폼(id/name)과 공식 downloadCsv()를 Selenium으로 호출하여 CSV 자동 수집
+- 안개일수/뇌전일수/결빙일수는 기상자료개방포털 실제 폼(id/name)과 공식 다운로드 폼을 HTTP로 직접 제출하여 CSV 자동 수집
 - 수집한 공식 CSV는 climate_stats 폴더에 자동 캐시하고, 실패 시에만 수동 업로드를 보조수단으로 사용
 - CSV의 0(실제 0)과 빈칸/―(자료 없음)를 구분
 - 2026년처럼 아직 완료되지 않은 연도의 미제공 월은 NaN으로 유지
@@ -22,7 +22,7 @@ Streamlit 종합 작업가능일수 산정 시스템
   예: STCS_안개일수_ANL_....csv, STCS_뇌전일수_ANL_....csv, STCS_결빙일수_ANL_....csv
 
 설치 예:
-    pip install streamlit pandas numpy requests openpyxl selenium xlrd py7zr pypdf pdfplumber
+    pip install streamlit pandas numpy requests beautifulsoup4 openpyxl xlrd py7zr pypdf pdfplumber
 
 실행:
     streamlit run app.py
@@ -1259,95 +1259,111 @@ def _invoke_portal_csv_download(driver, download_dir: Path, log: list[str]) -> P
     return path
 
 
-def auto_download_kma_climate_csv(
-    kind: str,
-    selected_label: str,
-    station_code: int,
-    start_year: int,
-    end_year: int,
-    headless: bool = True,
-) -> dict:
-    '''기상자료개방포털 공식 안개/뇌전/결빙 CSV를 자동 수집한다.
+def _direct_session(referer):
+    session = requests.Session()
+    session.headers.update({'User-Agent': 'WeatherWorkdayApp/1.0', 'Referer': referer})
+    return session
 
-    v2 핵심:
-    - hidden 상태의 원본 select도 정확한 DOM id로 직접 값 설정
-    - 지점 팝업 대신 schStnId/txtStnNm을 직접 설정
-    - 공식 페이지에 정의된 downloadCsv() 함수를 그대로 실행
-    '''
-    if kind not in KMA_CLIMATE_URLS:
-        raise ValueError(f'지원하지 않는 기후통계 종류: {kind}')
 
-    base = station_base_name(selected_label)
-    log: list[str] = []
-    driver = None
+def _direct_response(response):
+    if b'Request Blocked' in response.content[:4096]:
+        raise RuntimeError('자료 제공 서버가 직접 요청을 차단했습니다(Request Blocked). 수집 실패이며 0일 자료가 아닙니다.')
+    response.raise_for_status()
+    return response
 
-    with tempfile.TemporaryDirectory(prefix='kma_climate_') as tmp:
-        tmpdir = Path(tmp)
-        try:
-            driver, browser_name = _make_portal_driver(tmpdir, headless=headless)
-            log.append(f'자동 브라우저: {browser_name}')
-            driver.get(KMA_CLIMATE_URLS[kind])
-            log.append(f'페이지 접속: {kind}일수')
 
-            _wait_for_portal_form(driver, timeout=20)
-            _set_portal_form_exact(
-                driver=driver,
-                station_name=base,
-                station_code=station_code,
-                start_year=start_year,
-                end_year=end_year,
-                log=log,
-            )
+def _direct_form(html, selector):
+    from bs4 import BeautifulSoup
+    form = BeautifulSoup(html, 'html.parser').select_one(selector)
+    if form is None:
+        raise RuntimeError(f'공식 페이지의 조회폼({selector})을 찾지 못했습니다. 페이지 변경 또는 접근 제한을 확인하세요.')
+    params = {}
+    for node in form.select('input[name], select[name], textarea[name]'):
+        if node.has_attr('disabled'):
+            continue
+        kind = node.get('type', '').lower()
+        if kind in ('submit', 'button', 'file', 'reset'):
+            continue
+        if kind in ('checkbox', 'radio') and not node.has_attr('checked'):
+            continue
+        if node.name == 'select':
+            opt = node.select_one('option[selected]') or node.select_one('option')
+            value = opt.get('value', opt.get_text()) if opt else ''
+        elif node.name == 'textarea':
+            value = node.get_text()
+        else:
+            value = node.get('value', '')
+        params[node['name']] = value
+    return params
 
-            downloaded = _invoke_portal_csv_download(driver, tmpdir, log)
-            raw = downloaded.read_bytes()
-            parsed = parse_kma_climate_csv_bytes(raw, downloaded.name)
 
-            if parsed.get('kind') != kind:
-                raise RuntimeError(
-                    f"다운로드 파일 종류가 예상과 다릅니다: 예상={kind}, 실제={parsed.get('kind')}"
-                )
-            if not _station_matches(selected_label, parsed.get('station_name')):
-                raise RuntimeError(
-                    f"다운로드 지점이 예상과 다릅니다: 예상={selected_label}, 실제={parsed.get('station_name')}"
-                )
+def _direct_wink_stations(session):
+    session.headers.update({'AJAX': 'true', 'X-Requested-With': 'XMLHttpRequest'})
+    response = _direct_response(session.post('https://www.wink.go.kr/map/selectWaveLayerList.do', timeout=(15, 45)))
+    groups = response.json().get('resultData', {}).get('resultList')
+    if not isinstance(groups, list):
+        raise RuntimeError('WINK 관측지점 목록 응답 형식이 변경되었습니다.')
+    stations = [c for g in groups for c in g.get('children', []) if c.get('obsvId') and c.get('obsvNm')]
+    if not stations:
+        raise RuntimeError('WINK 관측지점 목록이 비어 있습니다.')
+    return stations
 
-            safe_station = re.sub(r'[^0-9A-Za-z가-힣_-]+', '_', parsed['station_name'])
-            out_name = f'{kind}일수_{safe_station}.csv'
-            out_path = CLIMATE_DIR / out_name
-            out_path.write_bytes(raw)
-            log.append(f'저장 완료: {out_name}')
 
-            return {
-                'ok': True,
-                'skipped': False,
-                'message': f"{kind}일수 자동 수집 완료: {parsed['station_name']}",
-                'path': str(out_path),
-                'parsed': parsed,
-                'log': log,
-            }
-        except Exception as exc:
-            debug_path = None
-            if driver is not None:
-                try:
-                    safe_kind = {'안개': 'fog', '뇌전': 'thunder', '결빙': 'freezing'}.get(kind, 'climate')
-                    debug_path = CLIMATE_DIR / f'_debug_{safe_kind}_{station_code}.html'
-                    debug_path.write_text(driver.page_source, encoding='utf-8', errors='ignore')
-                except Exception:
-                    debug_path = None
-            return {
-                'ok': False,
-                'skipped': False,
-                'message': f'{kind}일수 자동 수집 실패: {exc}',
-                'debug_path': str(debug_path) if debug_path else None,
-                'log': log,
-            }
-        finally:
-            if driver is not None:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
+def _direct_airkorea_links(html):
+    from bs4 import BeautifulSoup
+    links = {}
+    for cell in BeautifulSoup(html, 'html.parser').select('td'):
+        year = re.match(r'\s*(\d{4})년(\*)?', cell.get_text(' ', strip=True))
+        if not year:
+            continue
+        for node in cell.select('[href], [onclick]'):
+            match = re.search(r'(/jfile/readDownloadFile\.do[^\s\"\'<>]+)', node.get('href', '') + ' ' + node.get('onclick', ''))
+            if match:
+                links[int(year.group(1))] = {'url': urllib.parse.urljoin(AIRKOREA_FINAL_URL, match.group(1)), 'provisional': bool(year.group(2))}
+    if not links:
+        raise RuntimeError('에어코리아의 연도별 다운로드 링크를 찾지 못했습니다.')
+    return links
+
+
+def auto_download_kma_climate_csv(kind, selected_label, station_code, start_year, end_year, headless=True):
+    """공식 CSV 다운로드 폼을 HTTP 세션으로 제출한다. 브라우저 불필요."""
+    log = []
+    try:
+        url = KMA_CLIMATE_URLS[kind]
+        with _direct_session(url) as session:
+            page = _direct_response(session.get(url, timeout=(15, 45)))
+            page.encoding = 'utf-8'
+            params = _direct_form(page.text, '#schForm')
+            params.update(dataFormCd='F00513', schType='2', startYear=str(int(start_year)),
+                          endYear=str(int(end_year)), startMonth='01', endMonth='12', startMt='01', endMt='12',
+                          schStnId=str(station_code), txtStnNm=station_base_name(selected_label),
+                          pgmNo={'안개':'706','뇌전':'699','결빙':'707'}[kind],
+                          fileType='csv', firstLoading='N', selectType='1', downGubun='')
+            session.headers['X-Requested-With'] = 'XMLHttpRequest'
+            check = _direct_response(session.post('https://data.kma.go.kr/cmmn/checkPeriodOfDwld.do', data=params, timeout=(15, 45))).json()
+            if str(check.get('result')) not in ('00', '0'):
+                raise RuntimeError(f'포털 다운로드 기간 검사 실패: {check.get("result")} / 허용 개월수: {check.get("monthCo", "확인 필요")}')
+            endpoint = url.split('?')[0].replace('Chart.do', 'Download.do')
+            raw = _direct_response(session.post(endpoint, data=params, timeout=(15, 90))).content
+            if b'<html' in raw[:2048].lower() or b'<!doctype' in raw[:2048].lower():
+                raise RuntimeError('CSV 대신 오류 또는 로그인 페이지가 반환되었습니다.')
+            parsed = parse_kma_climate_csv_bytes(raw, '')
+            if parsed.get('kind') != kind or not _station_matches(selected_label, parsed.get('station_name')):
+                raise RuntimeError('다운로드 CSV의 현상 또는 관측지점이 요청값과 다릅니다.')
+            years = parsed['data']['연도']
+            if years.empty or not years.between(int(start_year), int(end_year)).all():
+                raise RuntimeError('다운로드 CSV의 연도가 요청 범위와 다릅니다.')
+            CLIMATE_DIR.mkdir(parents=True, exist_ok=True)
+            safe = re.sub(r'[^0-9A-Za-z가-힣_-]+', '_', parsed['station_name'])
+            path = CLIMATE_DIR / f'{kind}일수_{safe}.csv'
+            temp = path.with_suffix('.csv.part')
+            temp.write_bytes(raw)
+            temp.replace(path)
+            log.append(f'HTTP 직접 수집 / {kind} / {parsed["station_name"]} / {years.min()}~{years.max()}')
+            return {'ok':True, 'skipped':False, 'message':log[-1], 'path':str(path), 'parsed':parsed, 'log':log}
+    except Exception as exc:
+        return {'ok':False, 'skipped':False, 'message':f'{kind}일수 직접 수집 실패: {exc}', 'log':log}
+
 
 def ensure_climate_files_auto(
     selected_label: str,
@@ -6087,55 +6103,15 @@ def build_wink_occurrence_percent_display(matrix: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def fetch_wink_observation_station_catalog():
-    """WINK 파랑관측자료(selectMapVw.do) 좌측의 실제 관측지점 목록을 읽는다."""
-    driver = None
-    with tempfile.TemporaryDirectory(prefix="wink_obs_station_list_") as td:
-        try:
-            driver, browser_name = _make_portal_driver(Path(td), headless=True)
-            driver.get(WINK_OBS_URL)
-            S = _selenium_imports()
-            S["WebDriverWait"](driver, 30).until(
-                lambda d: d.execute_script("return document.readyState") == "complete"
-            )
-            time.sleep(2.5)
-            # 해역 그룹을 펼친다.
-            try:
-                driver.execute_script(
-                    r"""
-                    for(const name of ['서해안','남해안','동해안']){
-                        const el=[...document.querySelectorAll('a,button,div,span')].find(e=>
-                            ((e.innerText||e.textContent||'').replace(/\s+/g,' ').trim()===name));
-                        if(el){const c=el.closest('a,button,[role="button"],[onclick]')||el;try{c.click();}catch(e){}}
-                    }
-                    """
-                )
-                time.sleep(0.8)
-            except Exception:
-                pass
+    try:
+        with _direct_session(WINK_OBS_URL) as session:
+            _direct_response(session.get(WINK_OBS_URL, timeout=(15, 45)))
+            stations = _direct_wink_stations(session)
+            names = sorted({s['obsvNm'] for s in stations})
+            return {'ok':True, 'stations':names, 'message':f'WINK 관측지점 {len(names)}개 HTTP 직접 확인'}
+    except Exception as exc:
+        return {'ok':False, 'stations':list(WINK_STATION_FALLBACK), 'message':f'WINK 지점목록 확인 실패(실제 수집 시 재검증): {exc}'}
 
-            raw = driver.execute_script(
-                r"""
-                const root=document.querySelector('.map-lside')||document.querySelector('.map-lside-box')||document.body;
-                const vals=[];
-                for(const e of root.querySelectorAll('li, a, button, span')){
-                    const t=(e.innerText||e.textContent||'').replace(/\s+/g,' ').trim();
-                    if(t && t.length<=40) vals.push(t);
-                }
-                return vals;
-                """
-            ) or []
-            stations = _wink_normalize_station_labels(raw)
-            # 장기후측파랑 관련 숫자 격자/메뉴명이 끼지 않도록 추가 정리
-            stations = [x for x in stations if not re.fullmatch(r"\d+(?:[-:]\d+)?", x)]
-            if len(stations) < 8:
-                raise RuntimeError(f"WINK 파랑관측 지점목록을 충분히 읽지 못했습니다({len(stations)}개).")
-            return {"ok": True, "stations": stations, "message": f"WINK 관측지점 {len(stations)}개 자동확인", "browser": browser_name}
-        except Exception as exc:
-            return {"ok": False, "stations": list(WINK_STATION_FALLBACK), "message": f"WINK 지점목록 자동확인 실패 → 기본목록 사용: {exc}"}
-        finally:
-            if driver is not None:
-                try: driver.quit()
-                except Exception: pass
 
 
 def _wink_visible_text_click(driver, exact_text: str, contains: bool = False):
@@ -6703,110 +6679,75 @@ def _wink_fetch_graph_period(driver, start_date, end_date, log: list[str]):
     return df.reset_index(drop=True)
 
 
-def auto_fetch_wink_observation_yearly(station_name: str, start_year: int, end_year: int, headless: bool=True) -> dict:
-    """WINK 관측지점의 파랑 원시자료를 최대 1년 단위로 나눠 자동수집한다.
-
-    WINK 화면은 조회기간을 최대 1년으로 제한하므로, 선택한 연도범위를 연도별로 쪼개
-    /obsv/selectGraph.do를 호출한다. 각 연도의 유의파고/첨두주기 시계열을 합친 뒤
-    앱 내부에서 정확한 Hs/주기 기준으로 비작업일수를 계산한다.
-    """
-    log=[]; driver=None
+def auto_fetch_wink_observation_yearly(station_name, start_year, end_year, headless=True):
+    """공개 관측 그래프 조회를 HTTP로 수행. 파일 다운로드 동의를 대리 제출하지 않는다."""
+    log = []
+    status = []
     try:
-        with tempfile.TemporaryDirectory(prefix='wink_obs_yearly_') as td:
-            driver,browser_name=_make_portal_driver(Path(td),headless=headless)
-            log.append(f"자동 브라우저: {browser_name}")
-            driver.get(WINK_OBS_URL)
-            S=_selenium_imports()
-            S['WebDriverWait'](driver,30).until(lambda d:d.execute_script('return document.readyState')=='complete')
-            time.sleep(2.5)
-            log.append('WINK 파랑관측자료 화면 접속')
-
-            selected=_wink_select_observation_station(driver,station_name,log)
-            if not selected.get('ok'):
-                raise RuntimeError(selected.get('message'))
-            opened=_wink_open_wave_info_panel(driver,log)
-            if not opened.get('ok'):
-                raise RuntimeError(opened.get('message'))
-
-            cov_start,cov_end=_wink_extract_observation_coverage(driver)
-            req_start=pd.Timestamp(int(start_year),1,1)
-            req_end=pd.Timestamp(int(end_year),12,31)
-            eff_start=max(req_start,cov_start) if cov_start is not None else req_start
-            eff_end=min(req_end,cov_end) if cov_end is not None else req_end
-            if eff_start>eff_end:
-                raise RuntimeError(
-                    f"선택 연도 {start_year}~{end_year}가 {station_name}의 WINK 제공기간과 겹치지 않습니다."
-                )
-
-            yearly=[]; status_rows=[]
-            for year in range(int(eff_start.year), int(eff_end.year)+1):
-                ys=max(pd.Timestamp(year,1,1),eff_start)
-                ye=min(pd.Timestamp(year,12,31),eff_end)
-                if ys>ye:
-                    continue
-                # Jan 1~Dec 31도 날짜 차이는 365일이므로 WINK 최대 1년 제한을 만족한다.
+        with _direct_session(WINK_OBS_URL) as session:
+            _direct_response(session.get(WINK_OBS_URL, timeout=(15, 45)))
+            stations = _direct_wink_stations(session)
+            matches = [s for s in stations if s['obsvNm'] == station_name]
+            if len(matches) != 1:
+                raise RuntimeError(f'WINK 지점명 {station_name!r}을 유일하게 확인하지 못했습니다. 실제 지점 목록에서 다시 선택하세요.')
+            station = matches[0]
+            log.append(f'실제 관측지점: {station_name} / {station["obsvId"]}')
+            panel = _direct_response(session.post('https://www.wink.go.kr/obsv/selectObsvGraphVw.do',
+                data={'obsvType':'INFO', 'obsvId':station['obsvId'], 'waveType':'wave'}, timeout=(15, 60)))
+            panel.encoding = 'utf-8'
+            params = _direct_form(panel.text, '#searchForm')
+            if params.get('obsvId') != station['obsvId']:
+                raise RuntimeError('WINK 조회폼의 관측지점 식별자가 요청한 지점과 다릅니다.')
+            frames = []
+            for year in range(int(start_year), min(int(end_year), pd.Timestamp.now().year) + 1):
+                start = pd.Timestamp(year, 1, 1)
+                end = min(pd.Timestamp(year, 12, 31), pd.Timestamp.now().normalize())
+                row = {'연도':year, '조회시작':start.date(), '조회종료':end.date(), '자료건수':0, '상태':'오류', '오류':''}
                 try:
-                    dfy=_wink_fetch_graph_period(driver,ys,ye,log)
-                    if not dfy.empty:
-                        dfy['조회연도']=year
-                        yearly.append(dfy)
-                    status_rows.append({
-                        '연도':year,'조회시작':ys.date(),'조회종료':ye.date(),
-                        '자료건수':int(len(dfy)),'상태':'성공' if len(dfy)>0 else '자료없음','오류':''
-                    })
+                    values = dict(params)
+                    values.update(searchCondition='period', currentCondition='period', searchDate1=start.strftime('%Y-%m-%d'), searchDate2=end.strftime('%Y-%m-%d'))
+                    for key, val in [('searchDateS',values['searchDate1']), ('searchDateE',values['searchDate2'])]:
+                        if key in values:
+                            values[key] = val
+                    result = _direct_response(session.post('https://www.wink.go.kr/obsv/selectGraph.do', data=values, timeout=(15, 90))).json()
+                    records = result.get('resultData', {}).get('obsvChart')
+                    if not isinstance(records, list):
+                        raise RuntimeError('WINK 원시자료 응답 형식이 변경되었거나 조회가 거부되었습니다.')
+                    def pick(record, keys):
+                        return next((record[k] for k in keys if record.get(k) is not None), None)
+                    data = [(pick(r, ['obsvDt','obsrvnDt','date','datetime']), pick(r, ['sgnfctWvhgtVl0','sgnfctWvhgtVl','hs']), pick(r, ['pkprdVl0','pkprdVl','tp'])) for r in records if isinstance(r, dict)]
+                    frame = pd.DataFrame(data, columns=['일시','유의파고','주기'])
+                    frame['일시'] = pd.to_datetime(frame['일시'], errors='coerce')
+                    for col in ['유의파고','주기']:
+                        frame[col] = pd.to_numeric(frame[col], errors='coerce')
+                        frame.loc[frame[col] < 0, col] = np.nan
+                    frame = frame.dropna(subset=['일시','유의파고'])
+                    frame = frame[(frame['일시'] >= start) & (frame['일시'] < end + pd.Timedelta(days=1))].drop_duplicates('일시')
+                    if records and frame.empty:
+                        raise RuntimeError('응답 자료의 시간/파고 필드 또는 연도를 검증하지 못했습니다.')
+                    frame['조회연도'] = year
+                    if not frame.empty:
+                        frames.append(frame)
+                    row.update(자료건수=len(frame), 상태='성공' if len(frame) else '자료없음')
                 except Exception as exc:
-                    log.append(f"WINK {year}년 조회 오류: {exc}")
-                    status_rows.append({
-                        '연도':year,'조회시작':ys.date(),'조회종료':ye.date(),
-                        '자료건수':0,'상태':'오류','오류':str(exc)
-                    })
-                time.sleep(0.35)
-
-            combined=pd.concat(yearly,ignore_index=True) if yearly else pd.DataFrame(columns=['일시','유의파고','주기','조회연도'])
-            if not combined.empty:
-                combined=combined.drop_duplicates(subset=['일시'],keep='last').sort_values('일시').reset_index(drop=True)
-                safe_station=re.sub(r'[^0-9A-Za-z가-힣_.-]+','_',station_name)
-                cache_path=WINK_CACHE_DIR/f"wink_observation_{safe_station}_{start_year}_{end_year}.csv"
-                try:
-                    combined.to_csv(cache_path,index=False,encoding='utf-8-sig')
-                    log.append(f"WINK 연도별 원시자료 캐시 저장: {cache_path.name}")
-                except Exception as exc:
-                    log.append(f"WINK 캐시 저장 실패: {exc}")
-
-            status_df=pd.DataFrame(status_rows)
-            success_years=status_df.loc[status_df['자료건수']>0,'연도'].astype(int).tolist() if not status_df.empty else []
-            error_years=status_df.loc[status_df['상태']=='오류','연도'].astype(int).tolist() if not status_df.empty else []
-            if combined.empty:
-                raise RuntimeError(
-                    f"WINK {station_name}에서 {eff_start.date()}~{eff_end.date()} 기간의 원시 파랑자료를 가져오지 못했습니다."
-                )
-
-            return {
-                'ok':True,
-                'message':(
-                    f"WINK {station_name} 연도별 자동수집 성공: {len(success_years)}개 연도 / "
-                    f"원시자료 {len(combined):,}건" + (f" / 오류연도 {error_years}" if error_years else '')
-                ),
-                'wave_df':combined,
-                'year_status':status_df,
-                'coverage_start':cov_start,'coverage_end':cov_end,
-                'effective_start':eff_start,'effective_end':eff_end,
-                'success_years':success_years,'error_years':error_years,
-                'station_name':station_name,'log':log,
-            }
+                    row['오류'] = str(exc)
+                status.append(row)
+            errors = [r['연도'] for r in status if r['상태'] == '오류']
+            # 일부 연도 실패를 정상 자료로 계산해 평균이 왜곡되는 일을 방지한다.
+            if errors:
+                raise RuntimeError(f'WINK 조회 실패 연도 {errors}: ' + next(r['오류'] for r in status if r['오류']))
+            if not frames:
+                raise RuntimeError('선택 기간에 검증된 WINK 원시자료가 없습니다. 0일로 계산하지 않습니다.')
+            combined = pd.concat(frames, ignore_index=True).drop_duplicates('일시').sort_values('일시').reset_index(drop=True)
+            first, last = combined['일시'].min(), combined['일시'].max()
+            success = [r['연도'] for r in status if r['자료건수'] > 0]
+            return {'ok':True, 'message':f'WINK HTTP 직접 수집: {len(success)}개 연도, {len(combined):,}건', 'wave_df':combined,
+                    'year_status':pd.DataFrame(status), 'coverage_start':first, 'coverage_end':last,
+                    'effective_start':first.normalize(), 'effective_end':last.normalize(),
+                    'success_years':success, 'error_years':[], 'station_name':station_name, 'log':log}
     except Exception as exc:
-        debug_html=BASE_DIR/'wink_debug_observation.html';debug_png=BASE_DIR/'wink_debug_observation.png'
-        try:
-            if driver is not None:
-                debug_html.write_text(driver.page_source,encoding='utf-8')
-                driver.save_screenshot(str(debug_png))
-        except Exception:
-            pass
-        return {'ok':False,'message':str(exc),'log':log,'debug_html':str(debug_html),'debug_png':str(debug_png)}
-    finally:
-        if driver is not None:
-            try: driver.quit()
-            except Exception: pass
+        return {'ok':False, 'message':f'WINK 직접 수집 실패: {exc}', 'year_status':pd.DataFrame(status), 'log':log}
+
 
 AIRKOREA_FINAL_URL = "https://www.airkorea.or.kr/web/last_amb_hour_data?pMENU_NO=123"
 AIRKOREA_FIRST_YEAR = 2001
@@ -7354,225 +7295,56 @@ def _find_airkorea_year_download(driver, year: int):
     return downloadable[0], result.get("text") or year_text
 
 
-def _download_airkorea_final_years(
-    years,
-    headless: bool = True,
-    force: bool = False,
-) -> dict[int, dict]:
-    """
-    여러 연도의 전국 최종확정 ZIP을 순차 다운로드.
-
-    v29:
-    - 캐시 파일도 내부연도가 맞는지 먼저 검증
-    - 정확한 연도 td의 버튼만 클릭
-    - 다운로드 직후 ZIP 내부 파일명 + 측정일시 연도 검증
-    - 요청연도와 실제연도가 다르면 저장하지 않고 다시 시도
-    """
+def _download_airkorea_final_years(years, headless=True, force=False):
+    """공식 연도별 링크를 매번 확인하고 ZIP 스트리밍/내부 연도 검증 후 저장."""
     results = {}
-    wanted = []
-    now_year = int(pd.Timestamp.now().year)
-
-    for y in sorted({int(x) for x in years}):
-        if y < AIRKOREA_FIRST_YEAR or y > now_year:
-            results[y] = {
-                "ok": False,
-                "year": y,
-                "message": f"{y}년은 에어코리아 연도별 다운로드 범위 밖입니다.",
-            }
-            continue
-
-        cached = AIRKOREA_FINAL_DIR / f"airkorea_final_{y}.zip"
-        cache_check = _airkorea_validate_zip_path_for_year(cached, y)
-
-        if cache_check.get("ok") and not force:
-            results[y] = {
-                "ok": True,
-                "year": y,
-                "path": str(cached),
-                "cached": True,
-                "message": cache_check.get("message", "검증된 저장 ZIP 사용"),
-                "actual_year": cache_check.get("actual_year"),
-            }
-        else:
-            # 잘못 저장된 기존 파일은 삭제하지 않아도 되지만,
-            # 같은 이름으로 새 정상자료를 덮어쓰도록 다운로드 대상으로 지정.
-            wanted.append(y)
-
-    if not wanted:
-        return results
-
-    driver = None
-    temp_root = Path(tempfile.mkdtemp(prefix="airkorea_years_"))
-
-    try:
-        driver, browser = _make_portal_driver(temp_root, headless=headless)
-        S = _selenium_imports()
-        WebDriverWait = S["WebDriverWait"]
-
-        def open_page():
-            driver.get(AIRKOREA_FINAL_URL)
-            WebDriverWait(driver, 40).until(
-                lambda d: d.execute_script("return document.readyState") == "complete"
-            )
-            WebDriverWait(driver, 40).until(
-                lambda d: len(d.find_elements(S["By"].TAG_NAME, "td")) > 0
-            )
-            time.sleep(1.2)
-
-        open_page()
-
-        for y in wanted:
-            log = [
-                f"브라우저: {browser}",
-                f"요청연도: {y}",
-                "에어코리아 하단 연도별 전국 ZIP 다운로드 표 사용",
-            ]
-
-            last_error = None
-
-            for attempt in range(1, 3):
-                downloaded = None
-                try:
-                    el, ctx = _find_airkorea_year_download(driver, y)
-                    log.append(f"{attempt}차 정확셀 확인: {ctx}")
-
-                    driver.execute_script(
-                        "arguments[0].scrollIntoView({block:'center'});", el
-                    )
-                    time.sleep(0.3)
-
-                    started = time.time()
-                    try:
-                        driver.execute_script("arguments[0].click();", el)
-                    except Exception:
-                        el.click()
-
-                    downloaded = _wait_airkorea_download(
-                        temp_root, started, timeout=900
-                    )
-                    if downloaded is None:
-                        raise RuntimeError(
-                            f"{y}년 다운로드를 시작했지만 15분 안에 완료를 확인하지 못했습니다."
-                        )
-
-                    raw = downloaded.read_bytes()
-                    check = _airkorea_validate_zip_bytes_for_year(raw, y)
-                    log.append(
-                        f"다운로드 검증: expected={y}, "
-                        f"actual={check.get('actual_year')}, "
-                        f"message={check.get('message')}"
-                    )
-
-                    if not check.get("ok"):
-                        last_error = RuntimeError(
-                            f"{y}년 파일을 요청했지만 잘못된 ZIP이 내려왔습니다. "
-                            f"{check.get('message')}"
-                        )
-                        try:
-                            downloaded.unlink()
-                        except Exception:
-                            pass
-
-                        # 다음 시도는 페이지를 새로 열어 DOM/이벤트 상태를 초기화
-                        open_page()
-                        continue
-
-                    cached = AIRKOREA_FINAL_DIR / f"airkorea_final_{y}.zip"
-                    cached.write_bytes(raw)
-
-                    # 해당 연도의 모든 파생 캐시 무효화
-                    for pattern in (
-                        f"airkorea_region_{y}_*.pkl",
-                        f"airkorea_region_v27_{y}_*.pkl",
-                        f"airkorea_region_v29_hourly_{y}_*.pkl",
-                    ):
-                        for old in AIRKOREA_FINAL_DIR.glob(pattern):
-                            try:
-                                old.unlink()
-                            except Exception:
-                                pass
-
-                    results[y] = {
-                        "ok": True,
-                        "year": y,
-                        "path": str(cached),
-                        "cached": False,
-                        "filename": downloaded.name,
-                        "message": f"{y}년 전국 ZIP 다운로드 + 내부연도 검증 완료",
-                        "actual_year": check.get("actual_year"),
-                        "log": log,
-                    }
-
-                    try:
-                        downloaded.unlink()
-                    except Exception:
-                        pass
-
-                    last_error = None
-                    break
-
-                except Exception as exc:
-                    last_error = exc
-                    log.append(
-                        f"{attempt}차 실패: {type(exc).__name__}: {exc}"
-                    )
-                    try:
-                        if downloaded is not None and downloaded.exists():
-                            downloaded.unlink()
-                    except Exception:
-                        pass
-
-                    if attempt < 2:
-                        try:
-                            open_page()
-                        except Exception:
-                            pass
-
-            if last_error is not None and y not in results:
-                debug_html = AIRKOREA_FINAL_DIR / f"airkorea_debug_{y}.html"
-                debug_png = AIRKOREA_FINAL_DIR / f"airkorea_debug_{y}.png"
-
-                try:
-                    debug_html.write_text(
-                        driver.page_source,
-                        encoding="utf-8",
-                        errors="ignore",
-                    )
-                    driver.save_screenshot(str(debug_png))
-                except Exception:
-                    pass
-
-                results[y] = {
-                    "ok": False,
-                    "year": y,
-                    "message": str(last_error),
-                    "debug_html": str(debug_html),
-                    "debug_png": str(debug_png),
-                    "log": log,
-                }
-
-    except Exception as exc:
-        for y in wanted:
-            if y not in results:
-                results[y] = {
-                    "ok": False,
-                    "year": y,
-                    "message": f"에어코리아 자동브라우저 시작/접속 실패: {exc}",
-                }
-
-    finally:
-        if driver is not None:
-            try:
-                driver.quit()
-            except Exception:
-                pass
-
+    AIRKOREA_FINAL_DIR.mkdir(parents=True, exist_ok=True)
+    with _direct_session(AIRKOREA_FINAL_URL) as session:
         try:
-            shutil.rmtree(temp_root, ignore_errors=True)
-        except Exception:
-            pass
-
+            page = _direct_response(session.get(AIRKOREA_FINAL_URL, timeout=(15, 45)))
+            page.encoding = 'utf-8'
+            links = _direct_airkorea_links(page.text)
+        except Exception as exc:
+            return {int(y): {'ok':False, 'year':int(y), 'message':f'에어코리아 연도 목록 조회 실패: {exc}'} for y in years}
+        for year in sorted({int(y) for y in years}):
+            path = AIRKOREA_FINAL_DIR / f'airkorea_final_{year}.zip'
+            part = None
+            try:
+                if year not in links:
+                    raise RuntimeError(f'{year}년 자료가 공식 다운로드 목록에 없습니다.')
+                info = links[year]
+                if info['provisional']:
+                    raise RuntimeError(f'{year}년은 공식 페이지에서 * 표시된 자료로, 최종확정자료와 구분해야 하므로 자동 적용하지 않았습니다.')
+                checked = _airkorea_validate_zip_path_for_year(path, year)
+                if not force and checked.get('ok'):
+                    results[year] = {'ok':True, 'year':year, 'path':str(path), 'cached':True, 'actual_year':checked.get('actual_year'), 'message':'내부 연도가 검증된 저장 ZIP 사용'}
+                    continue
+                fd, tmp = tempfile.mkstemp(prefix=f'airkorea_{year}_', suffix='.zip', dir=str(AIRKOREA_FINAL_DIR))
+                os.close(fd)
+                part = Path(tmp)
+                with session.get(info['url'], stream=True, timeout=(15, 120)) as response:
+                    response.raise_for_status()
+                    with part.open('wb') as output:
+                        first = True
+                        for chunk in response.iter_content(1024 * 1024):
+                            if not chunk:
+                                continue
+                            if first and not chunk.startswith(b'PK'):
+                                raise RuntimeError('다운로드 응답이 ZIP이 아닙니다(오류/로그인 페이지 가능).')
+                            first = False
+                            output.write(chunk)
+                checked = _airkorea_validate_zip_path_for_year(part, year)
+                if not checked.get('ok'):
+                    raise RuntimeError(checked.get('message', '다운로드 ZIP 내부 연도 검증 실패'))
+                part.replace(path)
+                results[year] = {'ok':True, 'year':year, 'path':str(path), 'cached':False, 'actual_year':checked.get('actual_year'), 'message':f'{year}년 공식 ZIP 직접 다운로드 및 연도 검증 완료'}
+            except Exception as exc:
+                results[year] = {'ok':False, 'year':year, 'message':str(exc)}
+            finally:
+                if part is not None and part.exists():
+                    part.unlink()
     return results
+
 
 def _download_airkorea_final_year(year: int, headless: bool = True, force: bool = False) -> dict:
     """단일 연도 호환용 래퍼."""
@@ -25933,11 +25705,8 @@ if workday_mode != "바람장미도":
         )
 
         with st.expander("문제 해결 옵션", expanded=False):
-            show_auto_browser = st.checkbox(
-                "자동수집 브라우저 화면 표시",
-                value=False,
-                key="climate_browser_v34",
-            )
+            show_auto_browser = False
+            st.caption("기상청 공식 CSV를 HTTP로 직접 수집합니다.")
         # expander가 닫혀 있어도 변수는 항상 정의되어야 함
         if "show_auto_browser" not in locals():
             show_auto_browser = False
@@ -26121,11 +25890,8 @@ if workday_mode == "개정":
                 value=True,
                 key="wink_raw_auto_collect_v33",
             )
-            wink_show_browser = st.checkbox(
-                "WINK 자동수집 브라우저 화면 표시(문제 해결용)",
-                value=False,
-                key="wink_show_browser_v33",
-            )
+            wink_show_browser = False
+            st.caption("브라우저 없이 공개 관측 그래프를 직접 조회합니다. 파일 다운로드 설문의 동의를 대신 제출하지 않습니다.")
             st.markdown("[WINK 파랑관측자료 지도 열기](https://www.wink.go.kr/map/selectMapVw.do)")
 
         else:
@@ -26194,7 +25960,8 @@ if workday_mode == "개정":
         if pm10_year_range[1] >= _pm10_max_year - 1:
             st.caption("※ 최근 연도(*) 자료는 에어코리아 안내상 연간 확정 과정에서 일부 변경될 수 있습니다.")
         pm10_auto = st.checkbox("에어코리아 전국 연도 ZIP 자동수집 사용", value=True, key="pm10_final_auto")
-        pm10_show_browser = st.checkbox("PM10 자동수집 브라우저 화면 표시(문제 해결용)", value=False, key="pm10_final_show_browser")
+        pm10_show_browser = False
+        st.caption("에어코리아 공식 연도별 ZIP을 HTTP로 직접 수집합니다.")
 
         _pm10_zip_inv = _airkorea_zip_inventory(pm10_year_range[0], pm10_year_range[1])
         _pm10_ready = int((_pm10_zip_inv["ZIP상태"] == "✅ 확보").sum()) if not _pm10_zip_inv.empty else 0
