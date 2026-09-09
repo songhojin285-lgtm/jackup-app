@@ -25861,7 +25861,7 @@ if workday_mode == "개정":
                 max_value=_wink_max_year,
                 value=(int(_wink_default_start), int(_wink_default_end)),
                 key="wink_raw_year_range_v33",
-                help="WINK의 1년 조회 제한을 피하기 위해 앱이 내부적으로 연도별로 나누어 조회합니다.",
+                help="이 기간을 변경하면 PM10 분석기간도 함께 변경됩니다. WINK 자료는 연도별로 나누어 조회합니다.",
             )
             if st.button("🔄 WINK 관측지점 목록 새로고침", key="wink_station_catalog_refresh_v33", use_container_width=True):
                 try:
@@ -25949,14 +25949,23 @@ if workday_mode == "개정":
         _pm10_default_end = min(int(year_range[1]), max(AIRKOREA_FIRST_YEAR, _pm10_max_year - 2))
         if _pm10_default_end < _pm10_default_start:
             _pm10_default_end = min(_pm10_max_year, max(_pm10_default_start, int(year_range[1])))
+        # WINK 연도 선택을 기준으로 PM10 조회/캐시/계산/내보내기 기간을 함께 갱신한다.
+        # 위젯 생성 전에 상태를 설정하여 이전 PM10 선택값이 남지 않도록 한다.
+        _pm10_link_wave_years = wave_source_mode == "WINK 관측파랑 자동조회"
+        if _pm10_link_wave_years:
+            st.session_state["pm10_final_year_range"] = tuple(int(y) for y in wink_year_range)
+        elif "pm10_final_year_range" not in st.session_state:
+            st.session_state["pm10_final_year_range"] = (_pm10_default_start, _pm10_default_end)
         pm10_year_range = st.slider(
             "PM10 분석 연도(연도별 전국 ZIP)",
             min_value=AIRKOREA_FIRST_YEAR,
             max_value=_pm10_max_year,
-            value=(_pm10_default_start, _pm10_default_end),
             key="pm10_final_year_range",
-            help="에어코리아 연도별 자료는 2001년부터 제공됩니다. 최근 *표시 연도는 연간 확정 과정에서 일부 변경될 수 있습니다.",
+            disabled=_pm10_link_wave_years,
+            help="WINK 사용 시 파랑 분석기간과 자동 연동됩니다. PDF 사용 시 PM10 기간을 별도로 선택합니다.",
         )
+        if _pm10_link_wave_years:
+            st.caption(f"파랑 분석기간과 연동: {pm10_year_range[0]}~{pm10_year_range[1]}년. 변경은 파랑 설정에서 해주세요.")
         if pm10_year_range[1] >= _pm10_max_year - 1:
             st.caption("※ 최근 연도(*) 자료는 에어코리아 안내상 연간 확정 과정에서 일부 변경될 수 있습니다.")
         pm10_auto = st.checkbox("에어코리아 전국 연도 ZIP 자동수집 사용", value=True, key="pm10_final_auto")
