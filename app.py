@@ -7930,6 +7930,143 @@ def _airkorea_region_cache_path_v28(year: int, selected_label: str) -> Path:
     return AIRKOREA_FINAL_DIR / f"airkorea_region_v31_cells_{int(year)}_{key}.pkl"
 
 
+def _airkorea_region_ready(year, label):
+    p = _airkorea_region_cache_path_v28(year, label)
+    zp = _airkorea_zip_path(year)
+    try:
+        return p.stat().st_size > 100 and (not zp.exists() or p.stat().st_mtime_ns >= zp.stat().st_mtime_ns)
+    except OSError:
+        return False
+
+
+def _airkorea_data_inventory(label, start, end):
+    inv = _airkorea_zip_inventory(start, end)
+    for idx, row in inv.iterrows():
+        if row['ZIP상태'] != '✅ 확보' and _airkorea_region_ready(int(row['연도']), label):
+            inv.at[idx, 'ZIP상태'] = '✅ 확보'
+            inv.at[idx, '메시지'] = '지역자료 확보(원본 ZIP 없이 계산 가능)'
+    return inv
+
+
+def _airkorea_make_backup(label, start, end):
+    import json
+    manifest = {'format': 'airkorea-region-csv-v1', 'label': label,
+                'keywords': _airkorea_region_keywords(label), 'files': []}
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+        for year in range(int(start), int(end)+1):
+            if not _airkorea_region_ready(year, label): continue
+            frame = pd.read_pickle(_airkorea_region_cache_path_v28(year, label))
+            if frame.empty: continue
+            name = f'region_{year}.csv'
+            with archive.open(name, 'w', force_zip64=True) as stream:
+                with io.TextIOWrapper(stream, encoding='utf-8', newline='') as text:
+                    frame.to_csv(text, index=False)
+            if archive.getinfo(name).file_size > 256*1024*1024 or sum(x.file_size for x in archive.infolist()) > 1024*1024*1024-100000:
+                raise ValueError('지역자료 용량이 큽니다. 연도 범위를 나누어 백업하세요.')
+            manifest['files'].append({'year': year, 'name': name})
+            if buffer.tell() > 180*1024*1024:
+                raise ValueError('백업이 180MB를 넘습니다. 분석 연도를 나누어 각각 백업하세요.')
+        if not manifest['files']:
+            raise ValueError('선택한 지역·기간에 준비된 지역자료가 없습니다. 지역자료 빠른 준비를 먼저 실행하세요.')
+        archive.writestr('manifest.json', json.dumps(manifest, ensure_ascii=False))
+    return buffer.getvalue(), [item['year'] for item in manifest['files']]
+
+
+def _airkorea_restore_backup(upload, label):
+    """Only CSV+JSON is accepted. Never unpickle or extract user-supplied members."""
+    import json
+    required = ['지역','망','측정소코드','측정소명','주소','일시','PM10','PM25','PM10관측횟수']
+    upload.seek(0)
+    with zipfile.ZipFile(upload) as archive:
+        infos = archive.infolist()
+        if len(infos) > 151 or len({x.filename for x in infos}) != len(infos):
+            raise ValueError('잘못된 백업 파일 목록입니다.')
+        if sum(x.file_size for x in infos) > 1024*1024*1024:
+            raise ValueError('백업의 압축 해제 용량이 1GB를 넘습니다. 기간을 나누어 백업하세요.')
+        if archive.getinfo('manifest.json').file_size > 100000:
+            raise ValueError('백업 설명 파일이 너무 큽니다.')
+        manifest = json.loads(archive.read('manifest.json'))
+        if manifest.get('format') != 'airkorea-region-csv-v1':
+            raise ValueError('이 앱의 지역자료 백업 ZIP을 선택하세요. 원본 ZIP은 기존 업로드 칸을 사용하세요.')
+        if manifest.get('keywords') != _airkorea_region_keywords(label):
+            raise ValueError(f"이 백업의 지역은 {manifest.get('label','미확인')}입니다. 먼저 기상지점을 해당 지역으로 선택하세요.")
+        entries = manifest.get('files', [])
+        if not entries or len(entries)>150:
+            raise ValueError('백업에 연도 자료가 없습니다.')
+        years=[]
+        # Validate every member before publishing any restored cache.
+        with tempfile.TemporaryDirectory(dir=str(AIRKOREA_FINAL_DIR), prefix='restore_') as td:
+            for entry in entries:
+                year=int(entry['year']); name=entry['name']
+                if year < AIRKOREA_FIRST_YEAR or year > pd.Timestamp.now().year or year in years or name != f'region_{year}.csv':
+                    raise ValueError('백업 연도 또는 파일명이 올바르지 않습니다.')
+                if archive.getinfo(name).file_size > 256*1024*1024:
+                    raise ValueError('한 연도 자료가 너무 큽니다.')
+                with archive.open(name) as stream:
+                    frame=pd.read_csv(stream, dtype=str, keep_default_na=False)
+                if frame.empty or not set(required).issubset(frame.columns):
+                    raise ValueError(f'{year}년 자료의 필수 항목이 없습니다.')
+                frame=frame[required].copy()
+                frame['일시']=pd.to_datetime(frame['일시'], errors='coerce')
+                if frame['일시'].isna().any() or not frame['일시'].dt.year.eq(year).all():
+                    raise ValueError(f'{year}년 측정일시를 확인하세요.')
+                if frame['측정소명'].str.strip().eq('').any():
+                    raise ValueError('측정소명이 비어 있습니다.')
+                for col in ['PM10','PM25','PM10관측횟수']:
+                    values=pd.to_numeric(frame[col], errors='coerce')
+                    invalid=frame[col].ne('') & (values.isna() | ~np.isfinite(values) | values.lt(0))
+                    if invalid.any(): raise ValueError(f'{year}년 {col} 값이 올바르지 않습니다.')
+                    frame[col]=values
+                frame['PM10관측횟수']=frame['PM10관측횟수'].fillna(0).astype(int)
+                frame['날짜']=frame['일시'].dt.normalize()
+                frame['연도']=year; frame['월']=frame['일시'].dt.month
+                frame=_airkorea_attach_station_key(frame)
+                frame.to_pickle(Path(td)/f'{year}.pkl')
+                years.append(year)
+            if set(archive.namelist()) != {'manifest.json'} | {f'region_{y}.csv' for y in years}:
+                raise ValueError('백업에 예상하지 않은 파일이 들어 있습니다.')
+            for year in years:
+                os.replace(Path(td)/f'{year}.pkl', _airkorea_region_cache_path_v28(year,label))
+    return sorted(years)
+
+
+def _airkorea_backup_ui(label, start, end):
+    import hashlib
+    with st.expander('💾 지역자료 PC 백업·복원', expanded=False):
+        st.caption('선택 지역의 준비된 연도 자료를 PC에 저장합니다. 원본 전국 ZIP은 포함하지 않습니다. 복원 시 같은 지역을 먼저 선택하세요.')
+        upload = st.file_uploader('지역자료 백업 ZIP 선택(선택하면 자동 복원)', type=['zip'], key='pm_region_backup_restore_v1')
+        if upload is not None:
+            digest=hashlib.sha256(upload.getbuffer()).hexdigest()
+            identity=(digest, tuple(_airkorea_region_keywords(label)))
+            restored=st.session_state.get('_pm_restored_backup_v1')
+            available = bool(restored and restored[0]==identity and all(_airkorea_region_ready(y,label) for y in restored[1]))
+            if not available:
+                try:
+                    with st.spinner('백업 지역자료 복원 중...'):
+                        years=_airkorea_restore_backup(upload,label)
+                    st.session_state['_pm_restored_backup_v1']=(identity,years)
+                    st.success(f'복원 완료: {_year_list_text(years)}년. 분석 연도를 맞춘 뒤 기존 계산 버튼을 누르세요.')
+                except Exception as exc:
+                    st.error(f'복원 실패: {exc}')
+            else:
+                st.caption(f'복원된 자료 사용 중: {_year_list_text(restored[1])}년')
+        signature=_airkorea_catalog_signature(label,start,end)
+        key=(tuple(_airkorea_region_keywords(label)),int(start),int(end),signature)
+        if st.button('선택 지역·기간 백업 파일 만들기', key='pm_make_backup_v1'):
+            try:
+                with st.spinner('PC 저장용 백업 압축 중...'):
+                    data,years=_airkorea_make_backup(label,start,end)
+                st.session_state['_pm_backup_download_v1']=(key,data,years)
+            except Exception as exc:
+                st.error(f'백업 생성 실패: {exc}')
+        saved=st.session_state.get('_pm_backup_download_v1')
+        if saved and saved[0]==key:
+            st.download_button('지역자료 백업 다운로드(내 PC 저장)', data=saved[1],
+                file_name=f'airkorea_region_backup_{start}_{end}.zip',mime='application/zip',key='pm_backup_download_v1')
+            st.caption(f'포함 연도: {_year_list_text(saved[2])} / {len(saved[1])/1024/1024:.1f}MB. 다운로드 버튼까지 눌러야 PC에 저장됩니다.')
+
+
 def _airkorea_region_cache_inventory_v28(
     selected_label: str, start_year: int, end_year: int
 ) -> pd.DataFrame:
@@ -7939,12 +8076,7 @@ def _airkorea_region_cache_inventory_v28(
         zp = _airkorea_zip_path(y)
         ready = False
         try:
-            ready = (
-                p.exists()
-                and p.stat().st_size > 100
-                and zp.exists()
-                and p.stat().st_mtime >= zp.stat().st_mtime
-            )
+            ready = _airkorea_region_ready(y, selected_label)
         except Exception:
             ready = False
         rows.append({
@@ -8338,6 +8470,10 @@ def _airkorea_prepare_catalog_from_zips(
     frames_map = {}
 
     def process_year(year):
+        if _airkorea_region_ready(year, selected_label):
+            df = pd.read_pickle(_airkorea_region_cache_path_v28(year, selected_label))
+            return year, df, {"연도":year, "ZIP":"지역자료 사용", "지역파싱":"✅",
+                "지역자료건수":len(df), "처리방식":"캐시", "메시지":"준비된 지역자료 재사용"}
         ok_zip, zip_msg = _airkorea_zip_is_valid(year)
         if not ok_zip:
             return year, pd.DataFrame(), {
@@ -8411,9 +8547,11 @@ def _airkorea_catalog_signature(selected_label, start_year, end_year):
         p = _airkorea_region_cache_path_v28(year, selected_label)
         zp = _airkorea_zip_path(year)
         try:
-            ps, zs = p.stat(), zp.stat()
-            if ps.st_size > 100 and ps.st_mtime_ns >= zs.st_mtime_ns:
-                rows.append((year, str(p), ps.st_size, ps.st_mtime_ns, zs.st_size, zs.st_mtime_ns))
+            ps = p.stat()
+            zs = zp.stat() if zp.exists() else None
+            if _airkorea_region_ready(year, selected_label):
+                rows.append((year, str(p), ps.st_size, ps.st_mtime_ns,
+                             zs.st_size if zs else 0, zs.st_mtime_ns if zs else 0))
         except OSError:
             pass
     return tuple(rows)
@@ -8566,7 +8704,7 @@ def collect_airkorea_final_pm10(
     requested_count = len(years)
 
     # A. ZIP 전수검사
-    inventory_before = _airkorea_zip_inventory(start, end)
+    inventory_before = _airkorea_data_inventory(selected_label, start, end)
     missing = inventory_before.loc[
         inventory_before["ZIP상태"] != "✅ 확보", "연도"
     ].astype(int).tolist()
@@ -8579,7 +8717,7 @@ def collect_airkorea_final_pm10(
         )
 
     # B. 1차 후 남은 누락연도는 개별 재시도
-    inventory_mid = _airkorea_zip_inventory(start, end)
+    inventory_mid = _airkorea_data_inventory(selected_label, start, end)
     still_missing = inventory_mid.loc[
         inventory_mid["ZIP상태"] != "✅ 확보", "연도"
     ].astype(int).tolist()
@@ -8592,7 +8730,7 @@ def collect_airkorea_final_pm10(
                 force=True,
             )
 
-    inventory_final = _airkorea_zip_inventory(start, end)
+    inventory_final = _airkorea_data_inventory(selected_label, start, end)
     missing_final = inventory_final.loc[
         inventory_final["ZIP상태"] != "✅ 확보", "연도"
     ].astype(int).tolist()
@@ -8750,7 +8888,7 @@ def collect_airkorea_final_pm10(
         "unavailable_years": station_missing_years,
         "complete_zips": not missing_final,
         "message": (
-            f"ZIP {requested_count-len(missing_final)}/{requested_count}개년 확보·지역파싱 완료 → "
+            f"ZIP 또는 지역자료 {requested_count-len(missing_final)}/{requested_count}개년 확보 → "
             f"{name} 적용 / 판정 가능 월이 있는 연도 {len(station_ok_years)}/{requested_count}개년 / "
             f"시간별 자료 {len(h):,}건"
         ),
@@ -26153,7 +26291,9 @@ if workday_mode == "개정":
         pm10_show_browser = False
         st.caption("에어코리아 공식 연도별 ZIP을 HTTP로 직접 수집합니다.")
 
-        _pm10_zip_inv = _airkorea_zip_inventory(pm10_year_range[0], pm10_year_range[1])
+        _airkorea_backup_ui(station_name, pm10_year_range[0], pm10_year_range[1])
+
+        _pm10_zip_inv = _airkorea_data_inventory(station_name, pm10_year_range[0], pm10_year_range[1])
         _pm10_ready = int((_pm10_zip_inv["ZIP상태"] == "✅ 확보").sum()) if not _pm10_zip_inv.empty else 0
         _pm10_total = len(_pm10_zip_inv)
         _pm10_missing_years = (
@@ -26166,7 +26306,7 @@ if workday_mode == "개정":
                 f"추가 수집 또는 확인 필요: {_year_list_text(_pm10_missing_years)}년"
             )
             st.caption(
-                "위 목록은 현재 앱에 정상 ZIP이 확보되지 않은 연도입니다. "
+                "위 목록은 현재 앱에 ZIP 또는 해당 지역자료가 확보되지 않은 연도입니다. "
                 "관측자료가 없다는 뜻은 아닙니다. 연도 바를 변경한 뒤 아래 버튼을 누르면 "
                 "누락 연도를 수집합니다. 자동수집을 켠 상태에서 ‘데이터 수집 및 엑셀 생성’을 눌러도 수집됩니다."
             )
@@ -26217,8 +26357,8 @@ if workday_mode == "개정":
                 st.session_state["pm10_last_retry_results_v30"] = _retry_df
 
                 # 실제 저장 상태를 즉시 다시 검사한다.
-                _pm10_zip_inv = _airkorea_zip_inventory(
-                    pm10_year_range[0], pm10_year_range[1]
+                _pm10_zip_inv = _airkorea_data_inventory(
+                    station_name, pm10_year_range[0], pm10_year_range[1]
                 )
                 _pm10_ready = int(
                     (_pm10_zip_inv["ZIP상태"] == "✅ 확보").sum()
@@ -26329,7 +26469,7 @@ if workday_mode == "개정":
                         f"PM10·PM2.5 지역 빠른캐시: {_pm10_region_ready}/{_pm10_region_total}개년 생성"
                     )
         else:
-            st.caption("확보된 ZIP이 없습니다. 먼저 연도 ZIP을 받으면 측정소 목록을 준비할 수 있습니다.")
+            st.caption("확보된 자료가 없습니다. 지역자료 백업을 복원하거나 연도 ZIP을 받아주세요.")
 
         pm10_station_mode = st.radio(
             "PM10·PM2.5 측정소 선택 방식",
