@@ -9,9 +9,9 @@ Streamlit 종합 작업가능일수 산정 시스템
 - CSV의 0(실제 0)과 빈칸/―(자료 없음)를 구분
 - 2026년처럼 아직 완료되지 않은 연도의 미제공 월은 NaN으로 유지
 - 작업일수 산정 기준을 "기존" / "개정" 버튼으로 분리
-- 개정 기준: 고온33℃, 저온-12℃, 강우10mm, 최대풍속10m/s, 신적설5cm(해상)/1cm(육상), 공식 안개일수×30%, PM10·PM2.5 경보 농도 기준 충족일 합집합×50%, 장기파랑 기준 적용
+- 개정 기준: 고온33℃, 저온-12℃, 강우10mm, 최대풍속10m/s, 신적설5cm(해상)/1cm(육상), 공식 안개일수×30%, PM10 150, 장기파랑 기준 적용
 - 개정 기준의 파랑은 사용자가 WINK 관측파랑 자동조회 또는 장기파랑 검토서 PDF 자동판독 중 하나를 선택해 계산
-- 개정 미세먼지는 에어코리아 최종확정 ZIP 자동수집 후 PM10/PM2.5 경보 농도 기준 충족일 합집합에 50% 적용
+- 개정 기준 PM10은 에어코리아 API를 사용하지 않고 '최종확정자료 다운로드'의 전국 연도별 ZIP을 자동 내려받아 월별 시간자료를 분석
 
 필수 파일/환경
 - app.py
@@ -7412,9 +7412,9 @@ def _year_list_text(years) -> str:
         if y == p + 1:
             p = y
             continue
-        parts.append(str(s) if s == p else f"{s}–{p}")
+        parts.append(str(s) if s == p else f"{s}~{p}")
         s = p = y
-    parts.append(str(s) if s == p else f"{s}–{p}")
+    parts.append(str(s) if s == p else f"{s}~{p}")
     return ", ".join(parts)
 
 
@@ -7538,7 +7538,7 @@ def _airkorea_parse_measure_time(value):
 # v28은 XLSX 내부 XML에서 '선택 지역 행'만 바로 뽑는다.
 # 실제 2024년 파일 기준 약 49만 행 중 포항은 약 1만 행만 추출하면 된다.
 
-_AIRKOREA_FAST_CELL_RE = re.compile(rb'<c\b([^>]*?)(?<!/)>(.*?)</c>', re.S)
+_AIRKOREA_FAST_CELL_RE = re.compile(rb'<c\b([^>]*)>(.*?)</c>', re.S)
 _AIRKOREA_FAST_REF_RE = re.compile(rb'\br="([A-Z]+)\d+"')
 _AIRKOREA_FAST_TYPE_RE = re.compile(rb'\bt="([^"]+)"')
 _AIRKOREA_FAST_V_RE = re.compile(rb'<v>(.*?)</v>', re.S)
@@ -7565,27 +7565,20 @@ def _airkorea_fast_shared_strings(xlsx_zip: zipfile.ZipFile) -> list[str]:
 
 
 def _airkorea_fast_decode_cell(attrs: bytes, body: bytes, shared: list[str]) -> str:
-    import xml.etree.ElementTree as ET
     tm = _AIRKOREA_FAST_TYPE_RE.search(attrs)
-    cell_type = tm.group(1) if tm is not None else b''
-    if cell_type == b'e':
-        return ''
-    if cell_type == b'inlineStr':
-        try:
-            node = ET.fromstring(b'<cell>'+body+b'</cell>')
-            return ''.join(el.text or '' for el in node.iter() if el.tag.split('}')[-1]=='t')
-        except ET.ParseError:
-            return ''
     vm = _AIRKOREA_FAST_V_RE.search(body)
     if vm is None:
-        return ''
+        return ""
     raw = vm.group(1)
-    if cell_type == b's':
+    if tm is not None and tm.group(1) == b"s":
         try:
             return shared[int(raw)]
-        except (ValueError, IndexError):
-            return ''
-    return raw.decode('utf-8', errors='replace')
+        except Exception:
+            return ""
+    try:
+        return raw.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
 
 
 def _airkorea_fast_header_map(sheet_xml: bytes, shared: list[str]) -> dict[str, str]:
@@ -7609,89 +7602,12 @@ def _airkorea_fast_header_map(sheet_xml: bytes, shared: list[str]) -> dict[str, 
                 values[val] = col
 
         norm = {
-            re.sub(r"\s+", "", str(k)).replace("PM-10", "PM10").replace("PM-2.5", "PM25").replace("PM2.5", "PM25").replace("측졍일시", "측정일시"): v
+            re.sub(r"\s+", "", str(k)).replace("PM-10", "PM10").replace("측졍일시", "측정일시"): v
             for k, v in values.items()
         }
         if "측정일시" in norm and "PM10" in norm and "측정소명" in norm:
             return norm
     return {}
-
-
-def _pm_unique_value(values):
-    unique = set()
-    for value in values:
-        try:
-            v = float(value)
-        except (ValueError, TypeError):
-            return np.nan
-        if not np.isfinite(v) or v < 0:
-            return np.nan
-        unique.add(v)
-        if len(unique)>1:
-            return np.nan
-    return next(iter(unique)) if unique else np.nan
-
-
-def _pm_zip_monthly(frame, start, end, allow_partial=False):
-    """시간구간 시작시각 기준. 연속 두 번째 구간의 날짜로 집계한다."""
-    h = frame.copy()
-    h['일시'] = pd.to_datetime(h['일시'], errors='coerce')
-    for col in ('PM10','PM25'):
-        if col not in h: h[col] = np.nan
-        h[col] = pd.to_numeric(h[col], errors='coerce')
-        h[col] = h[col].where(np.isfinite(h[col]) & h[col].ge(0))
-    h = h.dropna(subset=['일시']).groupby('일시')[['PM10','PM25']].agg(_pm_unique_value)
-    begin, finish = pd.Timestamp(int(start),1,1), pd.Timestamp(int(end)+1,1,1)
-    grid = pd.date_range(begin-pd.Timedelta(hours=1), finish, freq='h', inclusive='left')
-    h = h.reindex(grid)
-    daily = pd.DataFrame(index=pd.date_range(begin,finish,freq='D',inclusive='left'))
-    evidence = h.loc[begin:].copy()
-    for col, threshold in [('PM10',300),('PM25',150)]:
-        x = h[col]
-        above = x.ge(threshold)
-        below = x.lt(threshold) & x.notna()
-        yes = above & above.shift(fill_value=False)
-        no = below | below.shift(fill_value=False)
-        unknown = ~(yes | no)
-        evidence[col+'연속2시간충족'] = yes.loc[begin:]
-        evidence[col+'직전시간농도'] = x.shift().loc[begin:]
-        # 어느 시간쌍이든 충족하면 1. 충족이 없고 가능한 미확인 쌍이 있으면 결측.
-        byday = pd.DataFrame({'yes':yes,'unknown':unknown,'valid':x.notna()}).loc[begin:]
-        agg = byday.groupby(byday.index.normalize()).agg({'yes':'any','unknown':'any','valid':'sum'})
-        daily[col+'충족'] = np.where(agg['yes'],1.,np.where(agg['unknown'],np.nan,0.))
-        daily[col+'유효시간'] = agg['valid']
-    p10,p25 = daily['PM10충족'],daily['PM25충족']
-    daily['중복제외충족일수'] = np.where(p10.eq(1)|p25.eq(1),1.,np.where(p10.eq(0)&p25.eq(0),0.,np.nan))
-    daily['적용비작업일수'] = daily['중복제외충족일수']*.5
-    daily.index.name='날짜'
-    daily=daily.reset_index()
-    daily['연도']=daily['날짜'].dt.year; daily['월']=daily['날짜'].dt.month
-    monthly=[]; today=pd.Timestamp.now().normalize()
-    for (year,month),g in daily.groupby(['연도','월']):
-        known=g['중복제외충족일수'].notna()
-        ended = bool(g['날짜'].max() < today)
-        complete = bool(known.all() and ended)
-        usable = complete or bool(allow_partial and ended and known.any())
-        def observed(c):
-            return float(g[c].sum(min_count=1))
-        hits = observed('중복제외충족일수')
-        unknown_days = int((~known).sum())
-        monthly.append({'연도':year,'월':month,
-            'PM10경보일수':observed('PM10충족') if usable else np.nan,
-            'PM25경보일수':observed('PM25충족') if usable else np.nan,
-            '동시경보일수':float((g['PM10충족'].eq(1)&g['PM25충족'].eq(1)).sum()) if usable else np.nan,
-            '경보발령일수':hits if usable else np.nan,
-            '미세먼지_경보50퍼센트':hits*.5 if usable else np.nan,
-            '경보자료확인일수':int(known.sum()) if usable else 0,
-            '확인된충족일수':hits,
-            '확인된비작업일수':hits*.5,
-            '가능한충족일수상한':hits+unknown_days if known.any() else np.nan,
-            '판정가능일수':int(known.sum()),'판정불가일수':unknown_days,
-            '월상태':('완료' if complete else '부분자료 적용(확인된 최소일수)' if usable
-                      else '진행 중/미도래' if not ended else '판정자료 없음' if not known.any() else '결측월 제외'),
-            'PM10유효시간':int(g['PM10유효시간'].sum()),'PM25유효시간':int(g['PM25유효시간'].sum())})
-    daily.attrs['hourly_evidence'] = evidence.reset_index(names='일시')
-    return pd.DataFrame(monthly),daily
 
 
 def _airkorea_fast_region_daily_from_xlsx(
@@ -7729,7 +7645,7 @@ def _airkorea_fast_region_daily_from_xlsx(
         }
 
     hmap = _airkorea_fast_header_map(sheet_xml, shared)
-    needed_names = ["지역", "망", "측정소코드", "측정소명", "측정일시", "PM10", "PM25", "주소"]
+    needed_names = ["지역", "망", "측정소코드", "측정소명", "측정일시", "PM10", "주소"]
     if not all(name in hmap for name in ["지역", "측정소명", "측정일시", "PM10"]):
         return pd.DataFrame(), {
             "ok": False,
@@ -7817,22 +7733,19 @@ def _airkorea_fast_region_daily_from_xlsx(
         except Exception:
             pm = np.nan
 
-        try:
-            pm25 = float(vals.get('PM25',''))
-            if not np.isfinite(pm25) or pm25 < 0: pm25 = np.nan
-        except (ValueError, TypeError):
-            pm25 = np.nan
         key = (region, network, code, station, addr, digits[:10])
-        # 상충하는 동일 시간값은 결측으로 보존한다.
-        cur = daily.setdefault(key, [[], []])
-        cur[0].append(pm)
-        cur[1].append(pm25)
+        cur = daily.get(key)
+        if cur is None:
+            daily[key] = [pm, 1 if np.isfinite(pm) else 0]
+        else:
+            if np.isfinite(pm):
+                if not np.isfinite(cur[0]) or pm > cur[0]:
+                    cur[0] = pm
+                cur[1] += 1
 
     rows = []
     timestamps = {}
-    for (region, network, code, station, addr, ymd), values in daily.items():
-        pmmax, pm25max = [_pm_unique_value(v) for v in values]
-        cnt = int(np.isfinite(pmmax))
+    for (region, network, code, station, addr, ymd), (pmmax, cnt) in daily.items():
         if ymd not in timestamps:
             timestamps[ymd] = _airkorea_hour_timestamp(ymd)
         dt = timestamps[ymd]
@@ -7844,7 +7757,6 @@ def _airkorea_fast_region_daily_from_xlsx(
             "측정소코드": code,
             "측정소명": station,
             "PM10": pmmax,
-            "PM25": pm25max,
             "PM10관측횟수": int(cnt),
             "주소": addr,
             "날짜": dt.normalize(),
@@ -7870,7 +7782,7 @@ def _airkorea_fast_region_daily_from_xlsx(
 def _airkorea_region_cache_path_v28(year: int, selected_label: str) -> Path:
     keywords = _airkorea_region_keywords(selected_label)
     key = _safe_filename_token("_".join(keywords[:3]))
-    return AIRKOREA_FINAL_DIR / f"airkorea_region_v31_cells_{int(year)}_{key}.pkl"
+    return AIRKOREA_FINAL_DIR / f"airkorea_region_v29_hourly_{int(year)}_{key}.pkl"
 
 
 def _airkorea_region_cache_inventory_v28(
@@ -7920,7 +7832,7 @@ def _airkorea_parse_year_region(
                     "year": year,
                     "cached": True,
                     "rows": len(df),
-                    "cache_version": "v31_cells_hourly",
+                    "cache_version": "v29_hourly_two_hour",
                 }
         except Exception:
             pass
@@ -7970,7 +7882,6 @@ def _airkorea_parse_year_region(
                         code_col = _airkorea_col(df, ["측정소코드"])
                         time_col = _airkorea_col(df, ["측정일시"])
                         pm_col = _airkorea_col(df, ["PM10"])
-                        pm25_col = _airkorea_col(df, ["PM25", "PM2.5", "PM-2.5"])
                         mang_col = _airkorea_col(df, ["망", "측정망"])
 
                         if time_col is None or pm_col is None or name_col is None:
@@ -7993,7 +7904,6 @@ def _airkorea_parse_year_region(
                             ),
                             "측정소명": sub[name_col].astype(str),
                             "PM10": pd.to_numeric(sub[pm_col], errors="coerce"),
-                            "PM25": pd.to_numeric(sub[pm25_col], errors="coerce") if pm25_col is not None else np.nan,
                             "주소": sub[addr_col].astype(str) if addr_col else "",
                             "일시": sub[time_col].map(_airkorea_hour_timestamp),
                         })
@@ -8007,8 +7917,7 @@ def _airkorea_parse_year_region(
                         out = (
                             out.groupby(group_cols, dropna=False, as_index=False)
                             .agg(
-                                PM10=("PM10", _pm_unique_value),
-                    PM25=("PM25", _pm_unique_value),
+                                PM10=("PM10", "max"),
                                 PM10관측횟수=("PM10", "count"),
                             )
                         )
@@ -8040,8 +7949,7 @@ def _airkorea_parse_year_region(
             result = (
                 result.groupby(group_cols, dropna=False, as_index=False)
                 .agg(
-                    PM10=("PM10", _pm_unique_value),
-                    PM25=("PM25", _pm_unique_value),
+                    PM10=("PM10", "max"),
                     PM10관측횟수=("PM10관측횟수", "sum"),
                 )
             )
@@ -8062,7 +7970,7 @@ def _airkorea_parse_year_region(
             "members_total": members_total,
             "members_parsed": members_parsed,
             "fast_seconds": round(fast_seconds, 1),
-            "cache_version": "v31_cells_hourly",
+            "cache_version": "v29_hourly_two_hour",
             "message": (
                 f"월파일 {members_parsed}/{members_total} 고속처리 · "
                 f"시간별 지역자료 {len(result):,}건"
@@ -8075,7 +7983,7 @@ def _airkorea_parse_year_region(
             "year": year,
             "message": str(exc),
             "member_errors": member_errors,
-            "cache_version": "v31_cells_hourly",
+            "cache_version": "v29_hourly_two_hour",
         }
 
 def _airkorea_norm_station_text(value) -> str:
@@ -8128,7 +8036,7 @@ def _airkorea_station_catalog(df: pd.DataFrame) -> pd.DataFrame:
         if c not in x.columns:
             x[c] = ""
 
-    x["PM10유효"] = pd.to_numeric(x["PM10"], errors="coerce").notna() & pd.to_numeric(x.get("PM25",pd.Series(np.nan,index=x.index)), errors="coerce").notna()
+    x["PM10유효"] = pd.to_numeric(x["PM10"], errors="coerce").notna()
     x["자료연도"] = pd.to_datetime(x["날짜"], errors="coerce").dt.year
 
     rows = []
@@ -8401,7 +8309,7 @@ def save_uploaded_airkorea_zips(uploaded_files) -> list[str]:
             for pattern in (
                 f"airkorea_region_{year}_*.pkl",
                 f"airkorea_region_v27_{year}_*.pkl",
-                f"airkorea_region_v31_cells_{year}_*.pkl",
+                f"airkorea_region_v29_hourly_{year}_*.pkl",
             ):
                 for old in AIRKOREA_FINAL_DIR.glob(pattern):
                     try:
@@ -8429,7 +8337,6 @@ def collect_airkorea_final_pm10(
     auto_download: bool = True,
     headless: bool = True,
     force_retry_missing: bool = False,
-    allow_partial: bool = False,
 ) -> tuple[pd.DataFrame, dict]:
     """
     에어코리아 최종확정 전국 연도 ZIP 기반 PM10 처리.
@@ -8439,8 +8346,8 @@ def collect_airkorea_final_pm10(
       ② 누락 ZIP 자동수집/재시도
       ③ 모든 ZIP 확보 후 선택지역 1~12월 자료 파싱
       ④ 전체기간 측정소 보유연도 비교
-      ⑤ 자동모드면 PM10·PM2.5 공동 보유기간이 긴 측정소 선택
-      ⑥ 같은 측정소의 PM10≥300 또는 PM2.5≥150 각각 2시간 연속 충족일 합집합 ×50% 계산
+      ⑤ 자동모드면 가장 장기간 PM10 자료가 있는 측정소 선택
+      ⑥ 그 측정소의 시간 PM10으로 월별 150㎍/㎥ 이상 발생일수 계산
     """
     start = max(AIRKOREA_FIRST_YEAR, int(start_year))
     end = min(int(end_year), int(pd.Timestamp.now().year))
@@ -8486,6 +8393,30 @@ def collect_airkorea_final_pm10(
         inventory_final["ZIP상태"] != "✅ 확보", "연도"
     ].astype(int).tolist()
 
+    if missing_final:
+        status = inventory_final.copy()
+        status["지역자료건수"] = np.nan
+        status["선택측정소"] = ""
+        status["PM10유효건수"] = np.nan
+        status["관측일수"] = np.nan
+        status["상태"] = np.where(
+            status["ZIP상태"].eq("✅ 확보"),
+            "ZIP 확보 / 계산대기",
+            "ZIP 미확보",
+        )
+        return pd.DataFrame(), {
+            "ok": False,
+            "complete_zips": False,
+            "message": (
+                f"선택기간 {start}~{end} 중 ZIP 미확보 연도: "
+                f"{_year_list_text(missing_final)}. "
+                "누락 ZIP을 모두 확보한 뒤 계산합니다."
+            ),
+            "missing_zip_years": missing_final,
+            "year_status": status,
+            "inventory": inventory_final,
+        }
+
     # C. 모든 ZIP을 지역 단위로 고속 파싱
     #    준비되지 않은 연도는 최대 2개씩 병렬 처리하고 v29 시간별캐시에 저장한다.
     catalog, _prep_status = _airkorea_prepare_catalog_from_zips(
@@ -8497,7 +8428,7 @@ def collect_airkorea_final_pm10(
     for year in years:
         p = _airkorea_region_cache_path_v28(year, selected_label)
         try:
-            d = pd.read_pickle(p) if p.exists() and year not in missing_final else pd.DataFrame()
+            d = pd.read_pickle(p) if p.exists() else pd.DataFrame()
         except Exception:
             d = pd.DataFrame()
 
@@ -8595,7 +8526,6 @@ def collect_airkorea_final_pm10(
 
         year_status_df.at[idx, "선택측정소"] = name
         year_status_df.at[idx, "PM10유효건수"] = int(valid["PM10"].count())
-        year_status_df.at[idx, "PM25유효건수"] = int(pd.to_numeric(hy.get("PM25",pd.Series(dtype=float)),errors="coerce").notna().sum())
         year_status_df.at[idx, "관측일수"] = int(valid["날짜"].nunique())
 
         if int(row["지역자료건수"]) == 0:
@@ -8614,15 +8544,34 @@ def collect_airkorea_final_pm10(
         y for y in years if y not in station_ok_years
     ]
 
-    monthly, daily = _pm_zip_monthly(h, start, end, allow_partial=allow_partial)
-    station_ok_years = sorted(monthly.loc[monthly['경보자료확인일수'] > 0, '연도'].unique().tolist())
-    station_missing_years = [y for y in years if y not in station_ok_years]
-    for idx, row in year_status_df.iterrows():
-        ym = monthly[monthly['연도']==int(row['연도'])]
-        year_status_df.at[idx,'계산가능월수'] = int(ym['경보자료확인일수'].gt(0).sum())
-        if int(row['연도']) in missing_final:
-            year_status_df.at[idx,'ZIP상태'] = 'ZIP 미확보'
-        year_status_df.at[idx,'상태'] = '계산 가능 월 있음' if ym['경보자료확인일수'].gt(0).any() else '판정불가(결측/미제공)'
+    # F. 동일 측정소의 시간자료에서 PM10 ≥150 연속 2시간 판정
+    daily = _airkorea_pm10_two_hour_daily(h)
+    daily["연도"] = daily["날짜"].dt.year
+    daily["월"] = daily["날짜"].dt.month
+
+    monthly = (
+        daily.groupby(["연도", "월"], as_index=False)
+        .agg(
+            PM10_150이상_개정=(
+                "PM10_150이상_개정",
+                lambda x: x.sum(min_count=1),
+            ),
+            PM10관측일수=(
+                "PM10관측횟수",
+                lambda x: int((x > 0).sum()),
+            ),
+            PM10월최대=("PM10최대", "max"),
+        )
+    )
+
+    # 선택기간 전체 연/월 틀
+    full = pd.MultiIndex.from_product(
+        [range(start, end + 1), range(1, 13)],
+        names=["연도", "월"],
+    ).to_frame(index=False)
+    monthly = full.merge(
+        monthly, on=["연도", "월"], how="left"
+    )
 
     coverage = (
         f"{h['날짜'].min().date()}~{h['날짜'].max().date()}"
@@ -8635,12 +8584,11 @@ def collect_airkorea_final_pm10(
     )
 
     return monthly, {
-        "ok": bool(station_ok_years),
-        "unavailable_years": station_missing_years,
-        "complete_zips": not missing_final,
+        "ok": True,
+        "complete_zips": True,
         "message": (
-            f"ZIP {requested_count-len(missing_final)}/{requested_count}개년 확보·지역파싱 완료 → "
-            f"{name} 적용 / 판정 가능 월이 있는 연도 {len(station_ok_years)}/{requested_count}개년 / "
+            f"ZIP {requested_count}/{requested_count}개년 확보·지역파싱 완료 → "
+            f"{name} 적용 / PM10 보유 {len(station_ok_years)}/{requested_count}개년 / "
             f"시간별 자료 {len(h):,}건"
         ),
         "coverage": coverage,
@@ -8659,7 +8607,6 @@ def collect_airkorea_final_pm10(
         "year_status": year_status_df,
         "inventory": inventory_final,
         "daily": daily,
-        "hourly_evidence": daily.attrs.get("hourly_evidence", pd.DataFrame()),
         "source": "에어코리아 최종확정자료(전국 연도 ZIP)",
         "analysis_years": f"{start}~{end}",
     }
@@ -24945,29 +24892,23 @@ def _report_live_grid(root, frame, title, note, total_template_row, source_templ
     return f"$A$1:${last_col}${footer}"
 
 
-# 실제 PM10/PM2.5 경보 이력 전용. 시간농도 ZIP 캐시와 혼용하지 않는다.
-PM_ALARM_VALUE = '미세먼지_경보50퍼센트'
-PM_ALARM_URL = 'https://apis.data.go.kr/B552584/UlfptcaAlarmInqireSvc/getUlfptcaAlarmInfo'
-PM_ALARM_FACTOR = 0.5  # 사용자 지정 적용계수 (공식 경보 발령 기준과 별개)
-
-
 def _report_pm10_export(monthly, status):
     columns=["연도"]+[f"{m}월" for m in range(1,13)]+["연합계"]
     if monthly is None or monthly.empty:
         return pd.DataFrame(columns=columns), "자료 없음 / 미세먼지를 수집한 뒤 다시 생성하세요."
     d=monthly.copy()
-    valid=pd.to_numeric(d.get("경보자료확인일수",pd.Series(0,index=d.index)),errors="coerce").gt(0)
-    d.loc[~valid,"미세먼지_경보50퍼센트"]=np.nan
+    valid=pd.to_numeric(d.get("PM10관측일수",pd.Series(0,index=d.index)),errors="coerce").gt(0)
+    d.loc[~valid,"PM10_150이상_개정"]=np.nan
     d=d[d["연도"].isin(d.loc[valid,"연도"].unique())]
-    frame=make_monthly_direct_pivot(d,"미세먼지_경보50퍼센트")
+    frame=make_monthly_direct_pivot(d,"PM10_150이상_개정")
     if frame.empty:
-        return pd.DataFrame(columns=columns), "선택 측정소의 판정 가능한 완료 월이 없습니다."
+        return pd.DataFrame(columns=columns), "선택 측정소의 유효 관측자료가 없습니다."
     years=frame["연도"].astype(int).tolist()
     means=frame.drop(columns="연도").mean()
     frame.loc[len(frame)]=["평균"]+means.tolist()
-    note=(f"자료: 에어코리아 최종확정 ZIP 시간농도 / {status.get('station_name','측정소 미확인')} "
-          f"/ 적용연도: {', '.join(map(str,years))} / PM10≥300·PM2.5≥150 각각 2시간 연속 충족일 합집합 × 50%(사용자 지정) "
-          "/ 주의보 제외 / 부분자료 적용 월은 확인된 최소일수(과소 산정 가능). 결측일은 별도 미확인 / 빈칸: 제외·미제공·미완료 월, 0: 관측으로 확인된 충족일 없음")
+    note=(f"자료: 에어코리아 / {status.get('station_name','측정소 미확인')} "
+          f"({status.get('station_code','')}) / 실제 관측연도: {', '.join(map(str,years))} "
+          "/ PM10≥150μg/m³ 연속 2시간 충족일 / 빈칸: 자료 없음, 0: 충족일 없음")
     return frame,note
 
 
@@ -25277,7 +25218,7 @@ def build_formatted_report_xlsx(
         live_areas["계급별 관측백분율"] = "$A$1:$V$30"
         live_areas["미세먼지"] = _report_live_grid(
             sheet("미세먼지"), pm_frame,
-            "1.7.10 미세먼지 (PM10·PM2.5 경보 농도 기준 충족일수 × 50%)", pm_note, 10, 11)
+            "1.7.10 미세먼지 (PM10 150μg/m³ 이상 연속 2시간)", pm_note, 10, 11)
         live_areas["파랑일수"] = _report_live_grid(
             sheet("파랑일수"), wave_frame, f"1.8.1 파랑일수 ({wave_criterion})",
             wave_note, 15, 17)
@@ -25511,13 +25452,10 @@ def calculate_workday_period_result(
         )
         rev_avg = revised_monthly.groupby("월").mean(numeric_only=True).reindex(range(1, 13)).round(2)
         rev_avg["안개_공식"] = obs_avg["안개일수_월간"].reindex(range(1, 13)).values
-        if not pm10.empty and "미세먼지_경보50퍼센트" in pm10.columns:
-            pm10_month_avg = pm10.groupby("월")["미세먼지_경보50퍼센트"].mean().reindex(range(1, 13))
+        if not pm10.empty and "PM10_150이상_개정" in pm10.columns:
+            pm10_month_avg = pm10.groupby("월")["PM10_150이상_개정"].mean().reindex(range(1, 13))
         else:
             pm10_month_avg = pd.Series(np.nan, index=range(1, 13), dtype=float)
-        if pm10_month_avg.isna().any():
-            return {"ok":False, "message":"해당 기간의 일부 월에 확인된 미세먼지 경보 자료가 없어 작업가능일수를 확정할 수 없습니다.",
-                    "start_year":int(start_year), "end_year":int(end_year), "actual_years":actual_years}
         rev_avg["미세먼지_개정"] = pm10_month_avg.values
         wave_series = (
             wave_month_avg.reindex(range(1, 13))
@@ -25557,7 +25495,7 @@ def calculate_workday_period_result(
                 "구분": [
                     "고온", "저온", "강우", "풍속", "강설(5cm)", "강설(1cm)",
                     "안개(기상자료개방포털 공식 안개일수)",
-                    "미세먼지(PM10·PM2.5 경보농도충족일×50%)", "파랑",
+                    "미세먼지(최종확정 PM10≥150 연속2시간)", "파랑",
                 ]
             }
         )
@@ -25827,11 +25765,6 @@ if workday_mode != "바람장미도":
 # ----------------------------------------------------------------------------
 # D. 개정 기준 변수 기본값 — 기존 화면에서도 계산 코드가 참조 가능하도록 정의
 # ----------------------------------------------------------------------------
-pm_alarm_key = ""
-pm_alarm_results = {}
-pm_alarm_district = ""
-pm_alarm_zone = ""
-pm_alarm_year_zones = {}
 pm10_station_name = ""
 pm10_station_code = ""
 pm10_station_addr = ""
@@ -26005,7 +25938,7 @@ if workday_mode == "개정":
                 else:
                     st.warning(wave_pdf_parse.get("message"))
 
-    with st.sidebar.expander("🌫️ PM10·PM2.5 설정", expanded=False):
+    with st.sidebar.expander("🌫️ PM10 설정", expanded=False):
 
         st.caption(
             "공공데이터포털/에어코리아 API Key는 사용하지 않습니다. "
@@ -26016,8 +25949,8 @@ if workday_mode == "개정":
         _pm10_default_end = min(int(year_range[1]), max(AIRKOREA_FIRST_YEAR, _pm10_max_year - 2))
         if _pm10_default_end < _pm10_default_start:
             _pm10_default_end = min(_pm10_max_year, max(_pm10_default_start, int(year_range[1])))
-        # 최초 진입 또는 파랑 기간이 실제로 바뀐 경우에만 PM10·PM2.5 기간을 동기화한다.
-        # PM10·PM2.5 단독 조정이나 다른 위젯의 재실행에서는 사용자가 선택한 값을 유지한다.
+        # 최초 진입 또는 파랑 기간이 실제로 바뀐 경우에만 PM10 기간을 동기화한다.
+        # PM10 단독 조정이나 다른 위젯의 재실행에서는 사용자가 선택한 값을 유지한다.
         _pm10_link_wave_years = wave_source_mode == "WINK 관측파랑 자동조회"
         if _pm10_link_wave_years:
             _current_wave_years = tuple(int(y) for y in wink_year_range)
@@ -26028,16 +25961,16 @@ if workday_mode == "개정":
         elif "pm10_final_year_range" not in st.session_state:
             st.session_state["pm10_final_year_range"] = (_pm10_default_start, _pm10_default_end)
         pm10_year_range = st.slider(
-            "PM10·PM2.5 분석 연도(연도별 전국 ZIP)",
+            "PM10 분석 연도(연도별 전국 ZIP)",
             min_value=AIRKOREA_FIRST_YEAR,
             max_value=_pm10_max_year,
             key="pm10_final_year_range",
-            help="파랑 분석기간을 변경하면 같은 기간으로 설정됩니다. 이후 이 바를 움직여 PM10·PM2.5 기간만 따로 조정할 수 있습니다.",
+            help="파랑 분석기간을 변경하면 같은 기간으로 설정됩니다. 이후 이 바를 움직여 PM10 기간만 따로 조정할 수 있습니다.",
         )
         if _pm10_link_wave_years:
-            st.caption("파랑 연도를 바꾸면 PM10·PM2.5도 함께 변경됩니다. PM10·PM2.5 바는 별도로 조정할 수 있습니다.")
+            st.caption("파랑 연도를 바꾸면 PM10도 함께 변경됩니다. PM10 바는 별도로 조정할 수 있습니다.")
         if pm10_year_range[1] >= _pm10_max_year - 1:
-            st.caption("※ 공식 다운로드 목록에서 * 표시된 미확정 연도는 자동 적용에서 제외됩니다. 실제 제외 연도와 이유는 다운로드 결과에 표시됩니다.")
+            st.caption("※ 최근 연도(*) 자료는 에어코리아 안내상 연간 확정 과정에서 일부 변경될 수 있습니다.")
         pm10_auto = st.checkbox("에어코리아 전국 연도 ZIP 자동수집 사용", value=True, key="pm10_final_auto")
         pm10_show_browser = False
         st.caption("에어코리아 공식 연도별 ZIP을 HTTP로 직접 수집합니다.")
@@ -26051,16 +25984,9 @@ if workday_mode == "개정":
         )
         if _pm10_missing_years:
             st.warning(
-                f"선택한 {_pm10_total}개년 중 저장·검증 완료: {_pm10_ready}개년\n\n"
-                f"추가 수집 또는 확인 필요: {_year_list_text(_pm10_missing_years)}년"
+                f"PM10 전국 ZIP(내부연도 검증): {_pm10_ready}/{_pm10_total}개년 · "
+                f"미확보: {_year_list_text(_pm10_missing_years)}"
             )
-            st.caption(
-                "위 목록은 현재 앱에 정상 ZIP이 확보되지 않은 연도입니다. "
-                "관측자료가 없다는 뜻은 아닙니다. 연도 바를 변경한 뒤 아래 버튼을 누르면 "
-                "누락 연도를 수집합니다. 자동수집을 켠 상태에서 ‘데이터 수집 및 엑셀 생성’을 눌러도 수집됩니다."
-            )
-            with st.expander("연도별 ZIP 확보 상태와 확인 사유", expanded=False):
-                st.dataframe(_pm10_zip_inv, use_container_width=True, hide_index=True)
 
             _pm10_retry_clicked = st.button(
                 "🔄 누락 연도 ZIP 다시 받기",
@@ -26142,7 +26068,7 @@ if workday_mode == "개정":
 
         else:
             st.success(
-                f"PM10·PM2.5 전국 ZIP(내부연도 검증): "
+                f"PM10 전국 ZIP(내부연도 검증): "
                 f"{_pm10_ready}/{_pm10_total}개년 모두 확보 "
                 f"(※ 측정소 보유연도와는 별개)"
             )
@@ -26157,7 +26083,7 @@ if workday_mode == "개정":
                     )
         _pm10_keywords = _airkorea_region_keywords(station_name)
         st.caption(
-            f"선택 기상지점 기준 PM10·PM2.5 지역검색: "
+            f"선택 기상지점 기준 PM10 지역검색: "
             f"**{' / '.join(_pm10_keywords[:3]) or _station_base_name(station_name)}**"
         )
 
@@ -26176,18 +26102,18 @@ if workday_mode == "개정":
         )
         _pm10_region_parse_status = pd.DataFrame()
 
-        if _pm10_ready > 0:
+        if not _pm10_missing_years:
             if _pm10_region_ready == _pm10_region_total and _pm10_region_total > 0:
                 st.success(
-                    f"PM10·PM2.5 지역 빠른캐시: {_pm10_region_ready}/{_pm10_region_total}개년 준비 완료"
+                    f"PM10 지역 빠른캐시: {_pm10_region_ready}/{_pm10_region_total}개년 준비 완료"
                 )
             else:
                 st.info(
-                    f"PM10·PM2.5 지역 빠른캐시: {_pm10_region_ready}/{_pm10_region_total}개년 · "
+                    f"PM10 지역 빠른캐시: {_pm10_region_ready}/{_pm10_region_total}개년 · "
                     "앱 실행만으로는 자동 분석하지 않습니다."
                 )
                 _pm10_prepare_now = st.button(
-                    "⚡ PM10·PM2.5 지역자료 빠른 준비",
+                    "⚡ PM10 지역자료 빠른 준비",
                     key=f"pm10_fast_prepare_v28_{station_code}",
                     use_container_width=True,
                     help=(
@@ -26198,7 +26124,7 @@ if workday_mode == "개정":
                 )
                 if _pm10_prepare_now:
                     with st.spinner(
-                        f"⚡ {_station_base_name(station_name)} PM10·PM2.5 빠른캐시 생성 중... "
+                        f"⚡ {_station_base_name(station_name)} PM10 빠른캐시 생성 중... "
                         f"({_pm10_region_ready}/{_pm10_region_total} → 준비)"
                     ):
                         _pm10_catalog_cached, _pm10_region_parse_status = (
@@ -26215,21 +26141,10 @@ if workday_mode == "개정":
                         (_pm10_region_cache_inv["지역캐시"] == "✅ 준비").sum()
                     )
                     st.success(
-                        f"PM10·PM2.5 지역 빠른캐시: {_pm10_region_ready}/{_pm10_region_total}개년 생성"
+                        f"PM10 지역 빠른캐시: {_pm10_region_ready}/{_pm10_region_total}개년 생성"
                     )
         else:
-            st.caption("확보된 ZIP이 없습니다. 먼저 연도 ZIP을 받으면 측정소 목록을 준비할 수 있습니다.")
-
-        pm10_station_mode = st.radio(
-            "PM10·PM2.5 측정소 선택 방식",
-            ["자동선택(가장 장기간 자료)", "직접선택"],
-            index=0,
-            key=f"pm10_station_mode_v27_{station_code}",
-            horizontal=False,
-        )
-        pm10_manual_station = (
-            pm10_station_mode == "직접선택"
-        )
+            st.caption("연도 ZIP이 모두 확보된 뒤 지역 빠른캐시를 만들 수 있습니다.")
 
         if not _pm10_catalog_cached.empty:
             _best = _pm10_catalog_cached.iloc[0]
@@ -26237,8 +26152,19 @@ if workday_mode == "개정":
             _best_name = str(_best.get("측정소명") or "")
             st.info(
                 f"자동추천 측정소: **{_best_name}** · "
-                f"PM10·PM2.5 보유 **{_best_years}/{len(range(pm10_year_range[0], pm10_year_range[1] + 1))}개년** "
+                f"PM10 보유 **{_best_years}/{len(range(pm10_year_range[0], pm10_year_range[1] + 1))}개년** "
                 f"({_best.get('보유연도') or '-'})"
+            )
+
+            pm10_station_mode = st.radio(
+                "PM10 측정소 선택 방식",
+                ["자동선택(가장 장기간 자료)", "직접선택"],
+                index=0,
+                key=f"pm10_station_mode_v27_{station_code}",
+                horizontal=False,
+            )
+            pm10_manual_station = (
+                pm10_station_mode == "직접선택"
             )
 
             if pm10_manual_station:
@@ -26268,7 +26194,7 @@ if workday_mode == "개정":
                     _pm10_lookup[u] = r.to_dict()
 
                 _sel_pm10 = st.selectbox(
-                    "PM10·PM2.5 측정소",
+                    "PM10 측정소",
                     _pm10_opts,
                     key=f"pm10_final_station_v27_{station_code}",
                 )
@@ -26293,7 +26219,7 @@ if workday_mode == "개정":
                 pm10_station_addr = ""
                 pm10_station_network = ""
 
-            with st.expander("PM10·PM2.5 측정소별 자료 보유기간 확인", expanded=False):
+            with st.expander("PM10 측정소별 자료 보유기간 확인", expanded=False):
                 _show_cols = [
                     "측정소명", "측정소코드", "망",
                     "보유연도수", "보유연도", "관측일수",
@@ -26321,18 +26247,14 @@ if workday_mode == "개정":
             if not _pm10_missing_years:
                 st.warning(
                     "전국 ZIP은 확보됐지만 선택 지역의 측정소 목록을 만들지 못했습니다. "
-                    "아래 'PM10·PM2.5 측정소별 자료 보유기간 확인' 상태 또는 연도 ZIP 내용을 확인하세요."
+                    "아래 'PM10 측정소별 자료 보유기간 확인' 상태 또는 연도 ZIP 내용을 확인하세요."
                 )
             else:
                 st.info(
-                    "확보된 연도의 지역자료 빠른 준비를 누르면 자료를 비교해 "
+                    "모든 연도 ZIP을 먼저 확보하면 전체기간 자료를 비교해 "
                     "가장 장기간 운영된 측정소를 자동추천합니다."
                 )
 
-        if pm10_manual_station and _pm10_catalog_cached.empty:
-            st.selectbox("PM10·PM2.5 측정소", ["지역자료 빠른 준비 후 선택"], disabled=True,
-                key=f"pm10_empty_station_{station_code}")
-            st.info("일부 연도 ZIP만 있어도 위 ‘지역자료 빠른 준비’ 버튼으로 측정소 목록을 만들 수 있습니다.")
         pm10_manual_zips = st.file_uploader(
             "에어코리아 전국 연도 ZIP 추가(자동수집 실패 시)", type=["zip"], accept_multiple_files=True, key="pm10_final_zip_upload"
         )
@@ -26340,16 +26262,9 @@ if workday_mode == "개정":
             _save_msgs = save_uploaded_airkorea_zips(pm10_manual_zips)
             with st.expander("업로드 ZIP 저장 결과", expanded=False):
                 for _m in _save_msgs: st.caption(_m)
-        pm10_allow_partial = st.checkbox(
-            "결측이 있는 월도 확인된 충족일수 적용", value=True, key="pm_partial_observed_v32",
-            help="선택 시 확인된 최소일수만 적용합니다. 결측일은 정상일로 판정하거나 환산하지 않습니다. 해제 시 모든 날짜가 판정 가능한 월만 사용합니다.")
-        if pm10_allow_partial:
-            st.caption("부분자료 월의 결과는 최소일수입니다. 결측 때문에 실제 비작업일수보다 적을 수 있습니다.")
         st.caption(
-            "판정: 같은 측정소의 PM10 ≥300 또는 PM2.5 ≥150㎍/㎥가 각각 연속 2시간이면 "
-            "두 번째 시간구간의 날짜를 집계합니다. 같은 날짜는 중복 제외하고 월별 50%를 적용합니다. "
-            "실제 경보 발령 내역이 아닌 경보 농도 기준 충족일입니다. "
-            "결측월 적용 여부는 위 설정을 따르며, 진행 중인 월과 판정자료가 없는 월은 제외합니다. 받은 ZIP과 지역자료는 저장해 재사용합니다."
+            "판정: **최종확정 PM10 시간값이 150㎍/㎥ 이상으로 연속 2시간 지속**이면 해당 날짜를 비작업일 1일로 계산합니다. "
+            "-999 등 음수 이상값은 결측으로 제외합니다. 한 번 받은 ZIP/지역 파싱자료는 `airkorea_final_cache`에 저장해 재사용합니다."
         )
 
 
@@ -26545,10 +26460,6 @@ elif workday_mode == "개정":
 if st.button("🚀 데이터 수집 및 엑셀 생성", type="primary"):
     if not api_key_daily:
         st.warning("⚠️ 좌측 사이드바에 공공데이터포털 API Key를 입력하세요.")
-        st.stop()
-
-    if workday_mode == "개정" and pm10_manual_station and not pm10_station_key:
-        st.warning("직접선택을 사용하려면 지역자료 빠른 준비 후 측정소를 선택하세요.")
         st.stop()
 
     # 정상 수집 메시지는 메인 화면에 여러 개의 알림 상자로 띄우지 않고
@@ -26875,28 +26786,37 @@ if st.button("🚀 데이터 수집 및 엑셀 생성", type="primary"):
             wave_occurrence_display = wave_manual_status.get("occurrence_table").copy()
             wave_occurrence_status = wave_manual_status.get("occurrence_status") or {"ok": not wave_occurrence_display.empty}
 
-        with st.spinner("최종확정 ZIP 자동수집 및 PM10·PM2.5 경보 농도 기준 판정 중..."):
+        with st.spinner(f"🌫️ 에어코리아 최종확정 PM10 {pm10_year_range[0]}~{pm10_year_range[1]} 수집/분석 중..."):
             pm10_monthly, pm10_status = collect_airkorea_final_pm10(
-                station_name, *pm10_year_range,
-                preferred_code=pm10_station_code, preferred_name=pm10_station_name,
-                preferred_key=pm10_station_key, manual_selection=pm10_manual_station,
-                auto_download=pm10_auto, headless=not pm10_show_browser,
-                force_retry_missing=False, allow_partial=pm10_allow_partial)
-        if not pm10_status.get("ok"):
-            st.error(f"미세먼지 경보 산정 불가: {pm10_status.get('message')}")
-            st.dataframe(pm10_status.get("year_status", pd.DataFrame()), use_container_width=True, hide_index=True)
-            st.info("판정 가능한 월이 없습니다. 결측월을 제외한 경우 설정의 ‘결측이 있는 월도 확인된 충족일수 적용’을 선택할 수 있습니다. 자료가 전혀 없는 월은 적용하지 않습니다.")
-            st.stop()
-        _partial = pm10_monthly['월상태'].eq('부분자료 적용(확인된 최소일수)')
-        if _partial.any():
-            st.warning(f"미세먼지 {_partial.sum()}개월은 부분자료입니다. 확인된 최소일수만 적용하므로 비작업일수가 과소 산정될 수 있습니다. 결측일은 0일로 판정하지 않으며, 월별 판정 불가일수를 산정 근거에서 확인하세요.")
-        pm10_station_name = pm10_status['station_name']
-        pm10_station_network = pm10_status.get("station_network", "")
-        run_status_log.append(f"미세먼지: {pm10_status['message']}")
-        if pm10_status.get("unavailable_years"):
-            st.warning("농도자료 판정 가능 월이 없는 연도는 0일로 처리하지 않고 평균에서 제외합니다: "
-                       + _year_list_text(pm10_status['unavailable_years']))
+                selected_label=station_name,
+                start_year=pm10_year_range[0],
+                end_year=pm10_year_range[1],
+                preferred_code=pm10_station_code,
+                preferred_name=pm10_station_name,
+                preferred_key=pm10_station_key,
+                manual_selection=pm10_manual_station,
+                auto_download=pm10_auto,
+                headless=not pm10_show_browser,
+                force_retry_missing=False,
+            )
+        if pm10_status.get("ok"):
+            pm10_station_key = pm10_status.get("station_key") or pm10_station_key
+            pm10_station_name = pm10_status.get("station_name") or pm10_station_name
+            pm10_station_code = pm10_status.get("station_code") or pm10_station_code
+            pm10_station_addr = pm10_status.get("station_addr") or pm10_station_addr
+            pm10_station_network = pm10_status.get("station_network") or pm10_station_network
+            run_status_log.append(
+                f"🌫️ PM10 최종확정자료 ({pm10_station_name}): {pm10_status.get('message')} / 적용범위 {pm10_status.get('coverage')}"
+            )
+            if pm10_status.get("station_missing_years"):
+                run_status_log.append(
+                    "ℹ️ 선택 측정소 자체의 미운영/PM10 자료없는 연도: "
+                    + _year_list_text(pm10_status.get("station_missing_years", []))
+                )
+        else:
+            st.warning(f"🌫️ PM10 최종확정자료 미적용: {pm10_status.get('message')}")
 
+    # 정상 처리 메시지는 하나의 접힌 상태창에만 표시한다.
     if run_status_log:
         with st.expander("ℹ️ 데이터 수집 상태", expanded=False):
             for _msg in run_status_log:
@@ -26942,7 +26862,7 @@ if st.button("🚀 데이터 수집 및 엑셀 생성", type="primary"):
     tables["신적설일수(5cm이상)"] = make_pivot(df_daily, "강설5cm_개정", "sum", "sum")
     tables["신적설일수(1cm이상)"] = make_pivot(df_daily, "강설1cm_개정", "sum", "sum")
     if not pm10_monthly.empty:
-        tables["미세먼지경보농도충족일수(50%적용)"] = make_monthly_direct_pivot(pm10_monthly, "미세먼지_경보50퍼센트")
+        tables["PM10일수(150이상연속2시간)"] = make_pivot(pm10_monthly, "PM10_150이상_개정", "sum", "sum")
 
     with st.spinner("보고서용 계급별 관측백분율을 준비하는 중..."):
         _, windrose_occurrence_table, windrose_status = resolve_shared_windrose(
@@ -27094,8 +27014,8 @@ if st.button("🚀 데이터 수집 및 엑셀 생성", type="primary"):
     wave_month_avg = wave_manual_month_avg.reindex(range(1, 13))
 
     if not pm10_monthly.empty:
-        pm10_month_avg = pm10_monthly.groupby("월")["미세먼지_경보50퍼센트"].mean().reindex(range(1, 13))
-        pm10_coverage = pm10_monthly.groupby("월")["경보자료확인일수"].sum().reindex(range(1, 13))
+        pm10_month_avg = pm10_monthly.groupby("월")["PM10_150이상_개정"].mean().reindex(range(1, 13))
+        pm10_coverage = pm10_monthly.groupby("월")["PM10관측일수"].sum().reindex(range(1, 13))
     else:
         pm10_month_avg = pd.Series(np.nan, index=range(1, 13), dtype=float)
         pm10_coverage = pd.Series(np.nan, index=range(1, 13), dtype=float)
@@ -27103,9 +27023,6 @@ if st.button("🚀 데이터 수집 및 엑셀 생성", type="primary"):
     rev_avg = revised_monthly.groupby("월").mean(numeric_only=True).reindex(range(1, 13)).round(2)
     # 개정 안개도 기상자료개방포털 공식 안개일수를 그대로 사용
     rev_avg["안개_공식"] = obs_avg["안개일수_월간"].reindex(range(1, 13)).values
-    if workday_mode == "개정" and pm10_month_avg.isna().any():
-        st.error("일부 월에 확인된 미세먼지 경보 자료가 없습니다. 수집상태를 확인하거나 완료된 연도를 포함해 분석기간을 조정하세요.")
-        st.stop()
     rev_avg["미세먼지_개정"] = pm10_month_avg.values
     rev_avg["파랑_개정"] = wave_month_avg.values
 
@@ -27142,7 +27059,7 @@ if st.button("🚀 데이터 수집 및 엑셀 생성", type="primary"):
     land_rev_df = append_sum_row(land_rev_df)
 
     rev_obs_disp = pd.DataFrame({
-        "구분": ["고온", "저온", "강우", "풍속", "강설(5cm)", "강설(1cm)", "안개(기상자료개방포털 공식 안개일수)", "미세먼지(PM10·PM2.5 경보농도충족일×50%)", "파랑"],
+        "구분": ["고온", "저온", "강우", "풍속", "강설(5cm)", "강설(1cm)", "안개(기상자료개방포털 공식 안개일수)", "미세먼지(최종확정 PM10≥150 연속2시간)", "파랑"],
     })
     rev_sources = [
         rev_avg["고온_개정"], rev_avg["저온_개정"], rev_avg["강우_개정"], rev_avg["풍속_개정"],
@@ -27196,7 +27113,7 @@ if st.button("🚀 데이터 수집 및 엑셀 생성", type="primary"):
         ["풍속", "최대풍속 10m/s 이상"],
         ["뇌전", "강우일수에 포함(별도 가산하지 않음)"],
         ["파랑", (f"{wave_criterion} / WINK 전체자료 제공기간 파고주기 계급별 출현율×365 후 12개월 균등배분" if "DCM" not in str(wave_criterion) else f"{wave_criterion} / WINK 전체자료 제공기간 기준 충족 출현율×365 후 12개월 균등배분")],
-        ["미세먼지", "PM10 또는 PM2.5 경보 농도 기준 충족일(날짜 중복 제외) × 50%(사용자 지정)"],
+        ["미세먼지", "에어코리아 최종확정 시간자료에서 PM10 150㎍/㎥ 이상 연속 2시간"],
     ], columns=["항목", "개정 기준"])
 
     # API 자료가 빠진 경우를 화면에 분명하게 표시하기 위한 상태
@@ -27425,27 +27342,56 @@ if st.button("🚀 데이터 수집 및 엑셀 생성", type="primary"):
                 st.dataframe(wave_month_table, use_container_width=True, hide_index=True)
 
             st.markdown("---")
-            st.markdown("### 🌫️ 미세먼지·초미세먼지 경보 농도 기준 충족일수")
-            st.caption("PM10 ≥300 또는 PM2.5 ≥150㎍/㎥가 각각 2시간 연속인 날짜를 중복 제외하여 50% 적용합니다. 실제 발령 이력이 아닌 농도 기준 충족일 · 부분자료 적용 시 확인된 최소일수만 반영 · 진행 중인 월 제외")
+            st.markdown("### 🌫️ 미세먼지(PM10) 일수")
             if not pm10_monthly.empty:
-                st.caption(f"적용 측정소: {pm10_station_name} / {pm10_status.get('coverage','')}")
-                st.markdown("#### 확인된 경보 농도 기준 충족일수(중복 제외, 보정 전)")
-                st.dataframe(make_monthly_direct_pivot(pm10_monthly, "경보발령일수"), use_container_width=True, hide_index=True)
-                st.markdown("#### 적용 비작업일수(경보 농도 기준 충족일수 × 50%)")
-                st.dataframe(make_monthly_direct_pivot(pm10_monthly, "미세먼지_경보50퍼센트"), use_container_width=True, hide_index=True)
-                with st.expander("항목별·중복·일별 산정 근거"):
-                    st.dataframe(pm10_monthly, use_container_width=True, hide_index=True)
-                    st.dataframe(pm10_status.get('daily',pd.DataFrame()), use_container_width=True, hide_index=True)
-                    _evidence = pm10_status.get('hourly_evidence',pd.DataFrame())
-                    if not _evidence.empty:
-                        st.caption("기준 충족 시간과 바로 전 시간의 실제 농도(㎍/㎥)")
-                        _hits = _evidence['PM10연속2시간충족'] | _evidence['PM25연속2시간충족']
-                        st.dataframe(_evidence.loc[_hits], use_container_width=True, hide_index=True)
-
-                with st.expander("연도별 ZIP·측정자료 수집상태"):
-                    st.dataframe(pm10_status.get('year_status',pd.DataFrame()), use_container_width=True, hide_index=True)
+                pm10_days_table = make_monthly_direct_pivot(pm10_monthly, "PM10_150이상_개정")
+                pm10_obs_table = make_monthly_direct_pivot(pm10_monthly, "PM10관측일수")
+                st.caption("에어코리아 최종확정 시간자료에서 PM10 150㎍/㎥ 이상이 연속 2시간이면 두 번째 시간구간의 날짜를 1일로 계산합니다. 시간 누락은 연속으로 인정하지 않으며 날짜별 중복은 제외합니다.")
+                st.markdown("#### PM10 150㎍/㎥ 이상 연속 2시간 충족일수")
+                st.dataframe(pm10_days_table, use_container_width=True, hide_index=True)
+                with st.expander("PM10 실제 관측일수 확인"):
+                    st.dataframe(pm10_obs_table, use_container_width=True, hide_index=True)
+                    if pm10_status.get("coverage"):
+                        st.caption(f"최종확정자료 실제 적용범위: {pm10_status.get('coverage')}")
+                    if pm10_station_name:
+                        st.caption(
+                            f"적용 측정소: {pm10_station_name} ({pm10_station_code or '-'}) · "
+                            f"{pm10_station_network or '-'} · {pm10_station_addr or '-'}"
+                        )
+                        if pm10_status.get("station_years"):
+                            _mode_text = (
+                                "직접선택"
+                                if pm10_status.get("manual_selection")
+                                else "자동선택(최장기간)"
+                            )
+                            st.caption(
+                                f"선택기간 내 측정소 PM10 보유연도: {pm10_status.get('station_years')} "
+                                f"({pm10_status.get('station_year_count', 0)}개년) · {_mode_text}"
+                            )
+                            if (
+                                pm10_status.get("max_station_year_count") is not None
+                                and pm10_status.get("station_year_count", 0)
+                                < pm10_status.get("max_station_year_count", 0)
+                            ):
+                                st.warning(
+                                    f"이 지역에서 더 긴 자료를 가진 측정소가 있습니다 "
+                                    f"(최대 {pm10_status.get('max_station_year_count')}개년)."
+                                )
+                        if pm10_status.get("station_missing_years"):
+                            st.warning(
+                                "ZIP은 모두 확보했지만 이 측정소가 미운영이거나 PM10 자료가 없는 연도: "
+                                + _year_list_text(pm10_status.get("station_missing_years", []))
+                            )
+                    if isinstance(pm10_status.get("year_status"), pd.DataFrame) and not pm10_status["year_status"].empty:
+                        with st.expander("에어코리아 연도별 ZIP 수집상태 확인", expanded=False):
+                            st.dataframe(pm10_status["year_status"], use_container_width=True, hide_index=True)
             else:
-                st.warning("판정 가능한 자료가 없습니다. ZIP 확보 및 측정소 자료 상태를 확인하세요.")
+                st.warning("PM10 자료가 없습니다. 측정소/기간을 에어코리아 사이트에서 고르는 방식이 아니라, 연도별 전국 ZIP 다운로드/파싱 상태를 확인하세요.")
+                if pm10_status.get("message"):
+                    st.caption(pm10_status.get("message"))
+                if isinstance(pm10_status.get("year_status"), pd.DataFrame) and not pm10_status["year_status"].empty:
+                    with st.expander("에어코리아 연도별 전국 ZIP 수집상태 확인", expanded=True):
+                        st.dataframe(pm10_status["year_status"], use_container_width=True, hide_index=True)
 
     with tabs[7]:
         period_defs = build_trailing_workday_windows(year_range[0], year_range[1])
@@ -27742,15 +27688,12 @@ if st.button("🚀 데이터 수집 및 엑셀 생성", type="primary"):
                     "근거문구": _pdf_r.get("snippet", ""),
                 }]).to_excel(writer, sheet_name="개정_장기파랑PDF정보", index=False)
             if not pm10_monthly.empty:
-                pm10_monthly.to_excel(writer, sheet_name="개정_미세먼지월별", index=False)
-                make_monthly_direct_pivot(pm10_monthly, "미세먼지_경보50퍼센트").to_excel(writer, sheet_name="개정_미세먼지50%일수", index=False)
-                make_monthly_direct_pivot(pm10_monthly, "경보발령일수").to_excel(writer, sheet_name="개정_농도기준충족일수", index=False)
-                if isinstance(pm10_status.get("alarm_records"), pd.DataFrame) and not pm10_status["alarm_records"].empty:
-                    pm10_status["alarm_records"].to_excel(writer, sheet_name="개정_경보발령원본", index=False)
+                pm10_monthly.to_excel(writer, sheet_name="개정_PM10월별", index=False)
+                make_monthly_direct_pivot(pm10_monthly, "PM10_150이상_개정").to_excel(writer, sheet_name="개정_PM10일수", index=False)
                 if isinstance(pm10_status.get("daily"), pd.DataFrame) and not pm10_status["daily"].empty:
-                    pm10_status["daily"].to_excel(writer, sheet_name="개정_농도기준일별판정", index=False)
+                    pm10_status["daily"].to_excel(writer, sheet_name="개정_PM10일별판정", index=False)
                 if isinstance(pm10_status.get("year_status"), pd.DataFrame) and not pm10_status["year_status"].empty:
-                    pm10_status["year_status"].to_excel(writer, sheet_name="개정_ZIP연도별수집", index=False)
+                    pm10_status["year_status"].to_excel(writer, sheet_name="개정_PM10연도별수집", index=False)
 
             if not windrose_occurrence_table.empty:
                 windrose_occurrence_table.to_excel(writer, sheet_name="계급별 관측백분율", index=False)
@@ -27759,12 +27702,12 @@ if st.button("🚀 데이터 수집 및 엑셀 생성", type="primary"):
                 "설정": [
                     "작업일수 산정 모드", "관측지점", "조회기간",
                     "파랑 기준", "파랑 자료원 방식", "파랑 적용기간/근거", "WINK 파랑 관측지점", "파랑 자료파일/자료원",
-                    "환산 연간 파랑 비작업일수", "미세먼지 자료원", "미세먼지 분석기간", "경보 지역·권역", "경보 적용계수", "경보 기준", "집계 방식"
+                    "환산 연간 파랑 비작업일수", "PM10 자료원", "PM10 분석기간", "PM10 측정소", "PM10 측정소코드", "PM10 측정망", "PM10 측정소주소"
                 ],
                 "값": [
                     workday_mode, station_name, f"{year_range[0]}~{year_range[1]}",
                     wave_criterion, wave_source_mode, (wave_manual_status.get("coverage") or (f"{wink_year_range[0]}~{wink_year_range[1]}" if wave_source_mode == "WINK 관측파랑 자동조회" else "PDF 자동판독")), wink_station_name if wave_source_mode == "WINK 관측파랑 자동조회" else "", wave_manual_status.get("source_file") or wink_source_name,
-                    wave_manual_status.get("annual_days"), "에어코리아 최종확정 ZIP 시간농도 자료", f"{pm10_year_range[0]}–{pm10_year_range[1]}", pm10_station_name, 0.5, "PM10≥300 또는 PM2.5≥150 각각 연속 2시간", "경보 농도 기준 충족일 합집합 × 50%"
+                    wave_manual_status.get("annual_days"), "에어코리아 최종확정 연도별 ZIP", f"{pm10_year_range[0]}~{pm10_year_range[1]}", pm10_station_name, pm10_station_code, pm10_station_network, pm10_station_addr
                 ]
             }).to_excel(writer, sheet_name="산정설정", index=False)
 
@@ -27796,8 +27739,8 @@ with st.expander("ℹ️ 안개/뇌전/결빙 자료 구조"):
 - 진행 중인 연도는 아직 제공되지 않은 월이 빈칸으로 남습니다.
 - 결빙은 목측 요소이므로 기상자료개방포털 목측지점이 아닌 지점은 자료 없음(NaN)으로 유지합니다.
 - **기존 작업일수**는 기존 산정계수를 그대로 유지합니다.
-- **개정 작업일수**는 고온33℃, 저온-12℃, 강우10mm, 최대풍속10m/s, 신적설(해상5cm/육상1cm), 기상자료개방포털 공식 안개일수×30%, PM10 또는 PM2.5 경보 농도 기준 충족일(날짜 중복 제외) × 50%(사용자 지정) 충족일, WINK 관측지점 파고·주기 출현율 산정값을 사용합니다. 사석공/대선 파랑은 Hs≥0.8m 출현회수÷전체회수×365로 연간 비작업일수를 산정한 뒤 12개월에 균등배분합니다. 뇌전은 강우에 포함하여 별도 가산하지 않습니다.
+- **개정 작업일수**는 고온33℃, 저온-12℃, 강우10mm, 최대풍속10m/s, 신적설(해상5cm/육상1cm), 기상자료개방포털 공식 안개일수×30%, 에어코리아 최종확정 시간자료에서 PM10 150㎍/㎥ 이상 연속 2시간 충족일, WINK 관측지점 파고·주기 출현율 산정값을 사용합니다. 사석공/대선 파랑은 Hs≥0.8m 출현회수÷전체회수×365로 연간 비작업일수를 산정한 뒤 12개월에 균등배분합니다. 뇌전은 강우에 포함하여 별도 가산하지 않습니다.
 - 개정 파랑은 **WINK 관측파랑 자동조회 / 장기파랑 PDF** 중 하나를 선택합니다. WINK 모드는 시간별 원시 유의파고·주기를 1년 단위로 조회하여 Hs≥0.8m를 직접 판정하고, PDF 모드는 보고서의 파랑 비작업일수 산정결과를 자동판독합니다.
-- 개정 미세먼지는 에어코리아 **최종확정 전국 연도 ZIP**을 자동 수집합니다. 같은 측정소의 시간평균 PM10≥300 또는 PM2.5≥150㎍/㎥가 각각 2시간 연속인 날짜를 중복 제외하고 50% 적용합니다. 실제 경보 발령 내역이 아닌 현재 경보 농도 기준 충족일이며, 결측월은 설정에 따라 확인된 최소일수를 적용하거나 제외하며, 진행 중인 월은 제외합니다.
+- 개정 PM10은 API를 사용하지 않습니다. 선택기간의 에어코리아 **최종확정자료 전국 연도 ZIP(2001년~)**을 먼저 전부 확보하고, 누락 연도만 재수집한 뒤 월별 시간자료를 결합합니다. 자동선택은 해당 기간에서 PM10 보유연도수가 가장 긴 측정소를 우선하며, PM10≥150㎍/㎥ 연속 2시간 충족일을 계산합니다. `-999` 등 이상값은 결측으로 제외하며 ZIP과 지역 파싱자료는 `airkorea_final_cache` 폴더에 캐시합니다.
         """
     )
