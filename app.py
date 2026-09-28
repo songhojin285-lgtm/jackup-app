@@ -7632,6 +7632,59 @@ def _pm_unique_value(values):
     return next(iter(unique)) if unique else np.nan
 
 
+def _pm_fast_group(frame, keys, count_mode=None):
+    """Native aggregations preserve strict missing/conflicting-value semantics."""
+    x = frame.copy()
+    for col in ('PM10', 'PM25'):
+        x[col] = pd.to_numeric(x[col], errors='coerce')
+        x[col] = x[col].where(np.isfinite(x[col]) & x[col].ge(0))
+    grouped = x.groupby(keys, dropna=False, sort=True)
+    size = grouped.size()
+    lo = grouped[['PM10','PM25']].min()
+    hi = grouped[['PM10','PM25']].max()
+    counts = grouped[['PM10','PM25']].count()
+    result = lo.where(lo.eq(hi) & counts.eq(size, axis=0))
+    if count_mode == 'sum':
+        result['PM10관측횟수'] = grouped['PM10관측횟수'].sum()
+    elif count_mode == 'count':
+        result['PM10관측횟수'] = counts['PM10']
+    return result.reset_index()
+
+
+def _pm_atomic_pickle(value, path):
+    """Publish complete cache files only, including across concurrent sessions."""
+    path = Path(path)
+    fd, name = tempfile.mkstemp(prefix=path.name+'.', suffix='.tmp', dir=str(path.parent))
+    os.close(fd)
+    try:
+        pd.to_pickle(value, name)
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name): os.unlink(name)
+
+
+def _pm_xlsx_rows(raw, sheet):
+    # Keep only one chunk and its trailing incomplete row in memory.
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        with z.open(sheet) as source:
+            buffer = b''
+            while True:
+                block = source.read(1024*1024)
+                if not block: break
+                buffer += block
+                start = 0
+                while True:
+                    end = buffer.find(b'</row>', start)
+                    if end < 0: break
+                    end += 6
+                    row_start = buffer.find(b'<row', start, end)
+                    if row_start >= 0: yield buffer[row_start:end]
+                    start = end
+                buffer = buffer[start:]
+                if len(buffer) > 32*1024*1024:
+                    raise ValueError('XLSX row exceeds supported size')
+
+
 def _pm_zip_monthly(frame, start, end, allow_partial=False):
     """시간구간 시작시각 기준. 연속 두 번째 구간의 날짜로 집계한다."""
     h = frame.copy()
@@ -7640,7 +7693,7 @@ def _pm_zip_monthly(frame, start, end, allow_partial=False):
         if col not in h: h[col] = np.nan
         h[col] = pd.to_numeric(h[col], errors='coerce')
         h[col] = h[col].where(np.isfinite(h[col]) & h[col].ge(0))
-    h = h.dropna(subset=['일시']).groupby('일시')[['PM10','PM25']].agg(_pm_unique_value)
+    h = _pm_fast_group(h.dropna(subset=['일시']), ['일시']).set_index('일시')
     begin, finish = pd.Timestamp(int(start),1,1), pd.Timestamp(int(end)+1,1,1)
     grid = pd.date_range(begin-pd.Timedelta(hours=1), finish, freq='h', inclusive='left')
     h = h.reindex(grid)
@@ -7720,7 +7773,9 @@ def _airkorea_fast_region_daily_from_xlsx(
                 raise ValueError("XLSX worksheet XML 없음")
 
             # 에어코리아 파일은 단일 시트 구조
-            sheet_xml = xz.read(sorted(sheets)[0])
+            sheet_name = sorted(sheets)[0]
+            with xz.open(sheet_name) as source:
+                sheet_xml = source.read(128*1024)
     except Exception as exc:
         return pd.DataFrame(), {
             "ok": False,
@@ -7766,12 +7821,10 @@ def _airkorea_fast_region_daily_from_xlsx(
     daily = {}
     matched_rows = 0
 
-    for m in region_pat.finditer(sheet_xml):
-        rs = sheet_xml.rfind(b"<row", 0, m.start())
-        re_ = sheet_xml.find(b"</row>", m.end())
-        if rs < 0 or re_ < 0:
+    del sheet_xml
+    for row_xml in _pm_xlsx_rows(raw, sheet_name):
+        if region_pat.search(row_xml) is None:
             continue
-        row_xml = sheet_xml[rs:re_ + 6]
         matched_rows += 1
 
         vals = {}
@@ -7824,14 +7877,18 @@ def _airkorea_fast_region_daily_from_xlsx(
             pm25 = np.nan
         key = (region, network, code, station, addr, digits[:10])
         # 상충하는 동일 시간값은 결측으로 보존한다.
-        cur = daily.setdefault(key, [[], []])
-        cur[0].append(pm)
-        cur[1].append(pm25)
+        cur = daily.get(key)
+        if cur is None:
+            daily[key] = [pm, pm25]
+        else:
+            for i, value in enumerate((pm, pm25)):
+                if not np.isfinite(value) or cur[i] != value:
+                    cur[i] = np.nan
 
     rows = []
     timestamps = {}
     for (region, network, code, station, addr, ymd), values in daily.items():
-        pmmax, pm25max = [_pm_unique_value(v) for v in values]
+        pmmax, pm25max = values
         cnt = int(np.isfinite(pmmax))
         if ymd not in timestamps:
             timestamps[ymd] = _airkorea_hour_timestamp(ymd)
@@ -7903,6 +7960,7 @@ def _airkorea_parse_year_region(
     year: int,
     selected_label: str,
     force: bool = False,
+    progress=None,
 ) -> tuple[pd.DataFrame, dict]:
     """
     v28 FAST:
@@ -7940,8 +7998,23 @@ def _airkorea_parse_year_region(
             ]
             members_total = len(members)
 
-            for member in members:
+            import hashlib
+            for member_index, member in enumerate(members, 1):
                 try:
+                    if progress:
+                        progress(f"{year}년 {Path(member).name} ({member_index}/{len(members)})")
+                    info = zf.getinfo(member)
+                    signature = f"{member}|{info.CRC}|{info.file_size}"
+                    token = hashlib.sha256(signature.encode()).hexdigest()[:20]
+                    checkpoint = cache.with_name(cache.stem + '_month_' + token + '.pkl')
+                    if checkpoint.exists() and not force:
+                        try:
+                            cached_month = pd.read_pickle(checkpoint)
+                            if not cached_month.empty: rows.append(cached_month)
+                            members_parsed += 1
+                            continue
+                        except Exception:
+                            pass
                     raw = zf.read(member)
                     suffix = Path(member).suffix.lower()
 
@@ -7953,6 +8026,7 @@ def _airkorea_parse_year_region(
                         if not d.empty:
                             rows.append(d)
                         if ps.get("ok"):
+                            _pm_atomic_pickle(d, checkpoint)
                             members_parsed += 1
                         else:
                             member_errors.append(
@@ -8004,17 +8078,11 @@ def _airkorea_parse_year_region(
 
                         # 동일 시간의 중복자료 정리
                         group_cols = ["지역", "망", "측정소코드", "측정소명", "주소", "날짜", "일시"]
-                        out = (
-                            out.groupby(group_cols, dropna=False, as_index=False)
-                            .agg(
-                                PM10=("PM10", _pm_unique_value),
-                    PM25=("PM25", _pm_unique_value),
-                                PM10관측횟수=("PM10", "count"),
-                            )
-                        )
+                        out = _pm_fast_group(out, group_cols, 'count')
                         out["연도"] = out["날짜"].dt.year
                         out["월"] = out["날짜"].dt.month
                         rows.append(out)
+                        _pm_atomic_pickle(out, checkpoint)
                         members_parsed += 1
 
                 except Exception as exc:
@@ -8037,19 +8105,14 @@ def _airkorea_parse_year_region(
             group_cols = [
                 "_측정소키","지역","망","측정소코드","측정소명","주소","날짜","일시"
             ]
-            result = (
-                result.groupby(group_cols, dropna=False, as_index=False)
-                .agg(
-                    PM10=("PM10", _pm_unique_value),
-                    PM25=("PM25", _pm_unique_value),
-                    PM10관측횟수=("PM10관측횟수", "sum"),
-                )
-            )
+            result = _pm_fast_group(result, group_cols, 'sum')
             result["연도"] = result["날짜"].dt.year
             result["월"] = result["날짜"].dt.month
 
         try:
-            result.to_pickle(cache)
+            # A failed member must be retried on the next run.
+            if members_parsed == members_total and not member_errors:
+                _pm_atomic_pickle(result, cache)
         except Exception:
             pass
 
@@ -8250,7 +8313,7 @@ def _airkorea_prepare_catalog_from_zips(
     end_year: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    v28: 준비되지 않은 연도만 최대 2개씩 병렬 처리.
+    준비되지 않은 연도를 순차 처리하며 완료한 월은 재사용합니다.
     각 연도는 XLSX XML 고속파서로 지역 시간별캐시를 만든다.
     이미 캐시된 연도는 수초 내 로드된다.
     """
@@ -8278,32 +8341,34 @@ def _airkorea_prepare_catalog_from_zips(
 
         zp = _airkorea_zip_path(year)
         df, ps = _airkorea_parse_year_region(
-            zp, year, selected_label, force=False
+            zp, year, selected_label, force=False, progress=progress_box.caption
         )
         return year, df, {
             "연도": year,
             "ZIP": "✅",
-            "지역파싱": "✅" if not df.empty else "⚠️",
+            "지역파싱": "✅" if not df.empty and not ps.get("member_errors") else "⚠️",
             "지역자료건수": int(len(df)),
             "처리방식": "캐시" if ps.get("cached") else "FAST XML",
             "메시지": (
                 "캐시"
                 if ps.get("cached")
                 else (
-                    ps.get("message")
+                    (ps.get("message", "") + (" · 일부 파일 실패: 다음 준비 시 재시도" if ps.get("member_errors") else ""))
                     or f"월파일 {ps.get('members_parsed',0)}/{ps.get('members_total',0)}"
                 )
             ),
         }
 
-    # 메모리 사용량을 과도하게 늘리지 않도록 2 workers만 사용
-    with ThreadPoolExecutor(max_workers=min(2, max(1, len(years)))) as ex:
-        futures = {ex.submit(process_year, y): y for y in years}
-        for fut in as_completed(futures):
-            y, df, status = fut.result()
+    progress_box = st.empty()
+    try:
+        for year in years:
+            y, df, status = process_year(year)
             status_map[y] = status
             if not df.empty:
                 frames_map[y] = df
+            progress_box.caption(f"{year}년 처리 완료 ({len(status_map)}/{len(years)})")
+    finally:
+        progress_box.empty()
 
     status = pd.DataFrame(
         [status_map[y] for y in sorted(status_map)]
