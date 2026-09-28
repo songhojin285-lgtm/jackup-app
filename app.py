@@ -8324,6 +8324,16 @@ def _airkorea_prepare_catalog_from_zips(
         int(end_year) + 1,
     ))
 
+    signature = _airkorea_catalog_signature(selected_label, start_year, end_year)
+    if len(signature) == len(years):
+        catalog = _airkorea_cached_catalog(selected_label, start_year, end_year)
+        if not catalog.empty:
+            return catalog, pd.DataFrame([{
+                "연도": year, "ZIP": "✅", "지역파싱": "✅",
+                "지역자료건수": np.nan, "처리방식": "캐시",
+                "메시지": "준비된 지역자료 재사용",
+            } for year in years])
+
     status_map = {}
     frames_map = {}
 
@@ -8381,33 +8391,69 @@ def _airkorea_prepare_catalog_from_zips(
         [frames_map[y] for y in sorted(frames_map)],
         ignore_index=True,
     )
-    return _airkorea_station_catalog(all_region), status
-
-def _airkorea_cached_catalog(
-    selected_label: str,
-    start_year: int,
-    end_year: int,
-) -> pd.DataFrame:
-    """v29 시간별 고속 지역캐시만 읽는다. 파일이 없으면 원본 ZIP을 여기서 파싱하지 않는다."""
-    frames = []
-    for y in range(max(AIRKOREA_FIRST_YEAR, int(start_year)), int(end_year) + 1):
-        p = _airkorea_region_cache_path_v28(y, selected_label)
-        zp = _airkorea_zip_path(y)
+    catalog = _airkorea_station_catalog(all_region)
+    # Save the catalog immediately after preparation for the next app session.
+    signature = _airkorea_catalog_signature(selected_label, start_year, end_year)
+    if signature and len(signature) == len(frames_map):
+        import hashlib
+        token = hashlib.sha256(repr(signature).encode('utf-8')).hexdigest()
+        saved = AIRKOREA_FINAL_DIR / ('airkorea_catalog_reuse_v1_' + token + '.pkl')
         try:
-            if (
-                p.exists() and p.stat().st_size > 100
-                and zp.exists()
-                and p.stat().st_mtime >= zp.stat().st_mtime
-            ):
-                d = pd.read_pickle(p)
-                if not d.empty:
-                    frames.append(d)
+            _pm_atomic_pickle(catalog, saved)
+        except OSError:
+            pass
+    return catalog, status
+
+def _airkorea_catalog_signature(selected_label, start_year, end_year):
+    """File fingerprints invalidate only the changed regional cache."""
+    rows = []
+    for year in range(max(AIRKOREA_FIRST_YEAR, int(start_year)), int(end_year)+1):
+        p = _airkorea_region_cache_path_v28(year, selected_label)
+        zp = _airkorea_zip_path(year)
+        try:
+            ps, zs = p.stat(), zp.stat()
+            if ps.st_size > 100 and ps.st_mtime_ns >= zs.st_mtime_ns:
+                rows.append((year, str(p), ps.st_size, ps.st_mtime_ns, zs.st_size, zs.st_mtime_ns))
+        except OSError:
+            pass
+    return tuple(rows)
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def _airkorea_catalog_from_signature(signature):
+    # Store only the small station catalog in memory, never the nationwide data.
+    import hashlib
+    if not signature:
+        return pd.DataFrame()
+    token = hashlib.sha256(repr(signature).encode('utf-8')).hexdigest()
+    saved = AIRKOREA_FINAL_DIR / ('airkorea_catalog_reuse_v1_' + token + '.pkl')
+    if saved.exists():
+        try:
+            catalog = pd.read_pickle(saved)
+            if isinstance(catalog, pd.DataFrame) and '측정소키' in catalog.columns:
+                return catalog
         except Exception:
             pass
-
+    frames = []
+    for _, path, *_ in signature:
+        # Do not cache an incomplete result after a read failure.
+        frame = pd.read_pickle(path)
+        if not frame.empty:
+            frames.append(frame)
     if not frames:
         return pd.DataFrame()
-    return _airkorea_station_catalog(pd.concat(frames, ignore_index=True))
+    catalog = _airkorea_station_catalog(pd.concat(frames, ignore_index=True))
+    _pm_atomic_pickle(catalog, saved)
+    return catalog
+
+
+def _airkorea_cached_catalog(selected_label, start_year, end_year):
+    """Reuse the saved station catalog across reruns and browser sessions."""
+    signature = _airkorea_catalog_signature(selected_label, start_year, end_year)
+    try:
+        return _airkorea_catalog_from_signature(signature)
+    except Exception:
+        return pd.DataFrame()
 
 
 def save_uploaded_airkorea_zips(uploaded_files) -> list[str]:
