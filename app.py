@@ -7687,6 +7687,8 @@ def _pm_xlsx_rows(raw, sheet):
 
 def _pm_zip_monthly(frame, start, end, allow_partial=False):
     """시간구간 시작시각 기준. 연속 두 번째 구간의 날짜로 집계한다."""
+    if '_전국일별' in frame and frame['_전국일별'].eq(1).any():
+        return _pm_aggregate_daily(_pm_compact_daily(frame,start,end),allow_partial)
     h = frame.copy()
     h['일시'] = pd.to_datetime(h['일시'], errors='coerce')
     for col in ('PM10','PM25'):
@@ -7719,6 +7721,12 @@ def _pm_zip_monthly(frame, start, end, allow_partial=False):
     daily.index.name='날짜'
     daily=daily.reset_index()
     daily['연도']=daily['날짜'].dt.year; daily['월']=daily['날짜'].dt.month
+    monthly,daily = _pm_aggregate_daily(daily,allow_partial)
+    daily.attrs['hourly_evidence'] = evidence.reset_index(names='일시')
+    return monthly,daily
+
+
+def _pm_aggregate_daily(daily,allow_partial=False):
     monthly=[]; today=pd.Timestamp.now().normalize()
     for (year,month),g in daily.groupby(['연도','월']):
         known=g['중복제외충족일수'].notna()
@@ -7743,7 +7751,6 @@ def _pm_zip_monthly(frame, start, end, allow_partial=False):
             '월상태':('완료' if complete else '부분자료 적용(확인된 최소일수)' if usable
                       else '진행 중/미도래' if not ended else '판정자료 없음' if not known.any() else '결측월 제외'),
             'PM10유효시간':int(g['PM10유효시간'].sum()),'PM25유효시간':int(g['PM25유효시간'].sum())})
-    daily.attrs['hourly_evidence'] = evidence.reset_index(names='일시')
     return pd.DataFrame(monthly),daily
 
 
@@ -7931,6 +7938,7 @@ def _airkorea_region_cache_path_v28(year: int, selected_label: str) -> Path:
 
 
 def _airkorea_region_ready(year, label):
+    if _pm_national_materialize(year,label): return True
     p = _airkorea_region_cache_path_v28(year, label)
     zp = _airkorea_zip_path(year)
     try:
@@ -8031,40 +8039,308 @@ def _airkorea_restore_backup(upload, label):
     return sorted(years)
 
 
-def _airkorea_backup_ui(label, start, end):
-    import hashlib
-    with st.expander('💾 지역자료 PC 백업·복원', expanded=False):
-        st.caption('선택 지역의 준비된 연도 자료를 PC에 저장합니다. 원본 전국 ZIP은 포함하지 않습니다. 복원 시 같은 지역을 먼저 선택하세요.')
-        upload = st.file_uploader('지역자료 백업 ZIP 선택(선택하면 자동 복원)', type=['zip'], key='pm_region_backup_restore_v1')
-        if upload is not None:
-            digest=hashlib.sha256(upload.getbuffer()).hexdigest()
-            identity=(digest, tuple(_airkorea_region_keywords(label)))
-            restored=st.session_state.get('_pm_restored_backup_v1')
-            available = bool(restored and restored[0]==identity and all(_airkorea_region_ready(y,label) for y in restored[1]))
-            if not available:
+# Nationwide compact cache. No uploaded pickle is ever deserialized.
+_PM_NATIONAL_FORMAT = 'airkorea-national-daily-v1'
+_PM_NATIONAL_RULE = 'PM10>=300;PM25>=150;2-consecutive-hours;interval-start;union;factor=0.5'
+_PM_NATIONAL_META = ['지역','망','측정소코드','측정소명','주소']
+_PM_NATIONAL_NUM = [p+s for p in ('PM10','PM25') for s in ('내부충족','내부미확인','유효시간','첫값','끝값')] + ['공동유효시간']
+
+
+def _pm_national_path(year):
+    return AIRKOREA_FINAL_DIR / f'airkorea_national_daily_v1_{int(year)}.pkl'
+
+
+def _pm_national_ready(year):
+    p, z = _pm_national_path(year), _airkorea_zip_path(year)
+    return p.exists() and (not z.exists() or p.stat().st_mtime_ns >= z.stat().st_mtime_ns)
+
+
+def _pm_compact_hourly(h, start, end):
+    """Preserve intraday evidence and midnight endpoints; no hourly reconstruction."""
+    h = h.copy()
+    h['일시'] = pd.to_datetime(h['일시'], errors='coerce')
+    for p in ('PM10','PM25'):
+        if p not in h: h[p] = np.nan
+        h[p] = pd.to_numeric(h[p], errors='coerce')
+        h[p] = h[p].where(np.isfinite(h[p]) & h[p].ge(0))
+    h = _pm_fast_group(h.dropna(subset=['일시']), ['일시']).set_index('일시')
+    grid = pd.date_range(f'{start}-01-01', f'{int(end)+1}-01-01', freq='h', inclusive='left')
+    h = h.reindex(grid)
+    d = pd.DataFrame(index=pd.date_range(f'{start}-01-01', f'{int(end)+1}-01-01', freq='D', inclusive='left'))
+    for p, threshold in [('PM10',300),('PM25',150)]:
+        a = h[p].to_numpy().reshape(-1,24)
+        above = a >= threshold
+        below = np.isfinite(a) & (a < threshold)
+        yes = above[:,1:] & above[:,:-1]
+        unknown = ~(yes | below[:,1:] | below[:,:-1])
+        d[p+'내부충족'] = yes.any(axis=1).astype(int)
+        d[p+'내부미확인'] = unknown.any(axis=1).astype(int)
+        d[p+'유효시간'] = np.isfinite(a).sum(axis=1)
+        d[p+'첫값'], d[p+'끝값'] = a[:,0], a[:,-1]
+    d['공동유효시간'] = (h['PM10'].notna() & h['PM25'].notna()).to_numpy().reshape(-1,24).sum(axis=1)
+    return d.rename_axis('날짜').reset_index()
+
+
+def _pm_compact_daily(frame, start, end):
+    # Mixed existing hourly caches and restored compact years are supported.
+    compact = frame.loc[frame['_전국일별'].eq(1)].copy() if '_전국일별' in frame else pd.DataFrame()
+    hourly = frame.loc[~frame['_전국일별'].eq(1)].copy() if '_전국일별' in frame else frame.copy()
+    parts = [compact] if not compact.empty else []
+    for year, g in (hourly.groupby('연도') if not hourly.empty else []):
+        parts.append(_pm_compact_hourly(g, int(year), int(year)))
+    dates = pd.date_range(f'{start}-01-01', f'{int(end)+1}-01-01', freq='D', inclusive='left')
+    c = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=['날짜']+_PM_NATIONAL_NUM)
+    c['날짜'] = pd.to_datetime(c['날짜'])
+    if c['날짜'].duplicated().any():
+        raise ValueError('같은 측정소·날짜의 전국 판정자료가 중복됩니다. 측정소 선택을 확인하세요.')
+    c = c.set_index('날짜').reindex(dates)
+    d = pd.DataFrame(index=dates)
+    for p, threshold in [('PM10',300),('PM25',150)]:
+        first, prev = c[p+'첫값'], c[p+'끝값'].shift()
+        yes = first.ge(threshold) & prev.ge(threshold)
+        no = first.lt(threshold) | prev.lt(threshold)
+        any_yes = c[p+'내부충족'].eq(1) | yes
+        any_unknown = c[p+'내부미확인'].fillna(1).eq(1) | ~(yes | no)
+        d[p+'충족'] = np.where(any_yes,1.,np.where(any_unknown,np.nan,0.))
+        d[p+'유효시간'] = c[p+'유효시간'].fillna(0).astype(int)
+    p10,p25 = d['PM10충족'],d['PM25충족']
+    d['중복제외충족일수'] = np.where(p10.eq(1)|p25.eq(1),1.,np.where(p10.eq(0)&p25.eq(0),0.,np.nan))
+    d['적용비작업일수'] = d['중복제외충족일수']*.5
+    d = d.rename_axis('날짜').reset_index()
+    d['연도'],d['월'] = d['날짜'].dt.year,d['날짜'].dt.month
+    return d
+
+
+def _pm_national_materialize(year, label):
+    if not _pm_national_ready(year): return False
+    source, target = _pm_national_path(year), _airkorea_region_cache_path_v28(year,label)
+    if target.exists() and target.stat().st_mtime_ns >= source.stat().st_mtime_ns: return True
+    d = pd.read_pickle(source)  # locally generated or validated CSV only
+    mask = _airkorea_region_mask(d, '지역', '주소', label)
+    d = d.loc[mask].copy()
+    d['_전국일별'] = 1
+    d['일시'] = d['날짜']
+    d['연도'],d['월'] = int(year),d['날짜'].dt.month
+    # Compatibility for station list only; never used as concentrations.
+    for p in ('PM10','PM25'):
+        d[p] = np.where(d[p+'유효시간'].gt(0),0.,np.nan)
+    d['PM10관측횟수'] = d['PM10유효시간']
+    d = _airkorea_attach_station_key(d)
+    _pm_atomic_pickle(d,target)
+    return True
+
+
+def _pm_national_member_rows(raw, member, year):
+    """Stream nationwide XLSX rows; CSV/XLS use the existing parser."""
+    if Path(member).suffix.lower() == '.xlsx':
+        with zipfile.ZipFile(io.BytesIO(raw)) as xz:
+            shared = _airkorea_fast_shared_strings(xz)
+            sheets = sorted(n for n in xz.namelist() if n.startswith('xl/worksheets/sheet') and n.endswith('.xml'))
+            if not sheets: raise ValueError('워크시트가 없습니다.')
+            # Do not silently omit a second sheet.
+            for sheet in sheets:
+                with xz.open(sheet) as f: header = f.read(128*1024)
+                hmap = _airkorea_fast_header_map(header,shared)
+                required = {'지역','측정소명','측정일시','PM10'}
+                if not required.issubset(hmap):
+                    raise ValueError(f'{sheet}: 필수 열 인식 실패 (전국 백업 중단)')
+                inverse = {v:k for k,v in hmap.items() if k in _PM_NATIONAL_META+['측정일시','PM10','PM25']}
+                for row in _pm_xlsx_rows(raw,sheet):
+                    vals = {}
+                    for cell in _AIRKOREA_FAST_CELL_RE.finditer(row):
+                        attrs,body = cell.group(1),cell.group(2)
+                        ref = _AIRKOREA_FAST_REF_RE.search(attrs)
+                        col = ref.group(1).decode('ascii') if ref else ''
+                        if col in inverse: vals[inverse[col]] = _airkorea_fast_decode_cell(attrs,body,shared)
+                    if vals.get('측정일시') == '측정일시': continue
+                    if vals: yield vals
+    else:
+        df = _airkorea_read_member(raw,member)
+        df = _airkorea_normalize_columns(df)
+        if not {'측정일시','측정소명','PM10'}.issubset(df.columns):
+            raise ValueError(f'{member}: 필수 열 인식 실패')
+        yield from df.to_dict('records')
+
+
+def _pm_build_national_year(year, progress):
+    import sqlite3, json, hashlib
+    if _pm_national_ready(year): return
+    zpath = _airkorea_zip_path(year)
+    ok, message = _airkorea_zip_is_valid(year)
+    if not ok: raise ValueError(f'{year}년 원본 ZIP 필요: {message}')
+    stat = zpath.stat()
+    sig = hashlib.sha256(f'{stat.st_size}:{stat.st_mtime_ns}'.encode()).hexdigest()[:16]
+    stage = AIRKOREA_FINAL_DIR / f'national_stage_{year}_{sig}.sqlite'
+    con = sqlite3.connect(stage)
+    try:
+        con.executescript('''CREATE TABLE IF NOT EXISTS stations(id TEXT PRIMARY KEY, meta TEXT);
+        CREATE TABLE IF NOT EXISTS hours(sid TEXT,t TEXT,p10 REAL,p25 REAL,PRIMARY KEY(sid,t)) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS done(member TEXT PRIMARY KEY);''')
+        con.execute('PRAGMA cache_size=-16000')
+        sql = '''INSERT INTO hours VALUES(?,?,?,?) ON CONFLICT(sid,t) DO UPDATE SET
+            p10=CASE WHEN hours.p10=excluded.p10 THEN hours.p10 ELSE NULL END,
+            p25=CASE WHEN hours.p25=excluded.p25 THEN hours.p25 ELSE NULL END'''
+        with zipfile.ZipFile(zpath) as archive:
+            members = [n for n in archive.namelist() if Path(n).suffix.lower() in {'.xlsx','.xls','.csv'} and not n.startswith('__MACOSX')]
+            if not members: raise ValueError('처리할 월별 파일이 없습니다.')
+            for i, member in enumerate(members,1):
+                if con.execute('SELECT 1 FROM done WHERE member=?',(member,)).fetchone(): continue
+                progress(f'{year}년 전국 자료: {Path(member).name} ({i}/{len(members)})')
+                count=0; batch=[]; metas={}; timestamps={}
                 try:
-                    with st.spinner('백업 지역자료 복원 중...'):
-                        years=_airkorea_restore_backup(upload,label)
-                    st.session_state['_pm_restored_backup_v1']=(identity,years)
-                    st.success(f'복원 완료: {_year_list_text(years)}년. 분석 연도를 맞춘 뒤 기존 계산 버튼을 누르세요.')
-                except Exception as exc:
-                    st.error(f'복원 실패: {exc}')
-            else:
-                st.caption(f'복원된 자료 사용 중: {_year_list_text(restored[1])}년')
-        signature=_airkorea_catalog_signature(label,start,end)
-        key=(tuple(_airkorea_region_keywords(label)),int(start),int(end),signature)
-        if st.button('선택 지역·기간 백업 파일 만들기', key='pm_make_backup_v1'):
+                    con.execute('BEGIN')
+                    for vals in _pm_national_member_rows(archive.read(member),member,year):
+                        name = str(vals.get('측정소명','')).strip()
+                        stamp = str(vals.get('측정일시',''))
+                        if stamp not in timestamps: timestamps[stamp] = _airkorea_hour_timestamp(stamp)
+                        dt = timestamps[stamp]
+                        if not name or pd.isna(dt) or dt.year != int(year): continue
+                        meta = {c:str(vals.get(c,'') or '').strip() for c in _PM_NATIONAL_META}
+                        meta['측정소코드'] = re.sub(r'\.0$','',meta['측정소코드'])
+                        # Match the existing name+network identity within a region.
+                        sid = json.dumps([meta['지역'],name,meta['망']],ensure_ascii=False)
+                        metas[sid] = json.dumps(meta,ensure_ascii=False)
+                        values=[]
+                        for p in ('PM10','PM25'):
+                            try: v=float(vals.get(p,''))
+                            except (TypeError,ValueError): v=np.nan
+                            values.append(v if np.isfinite(v) and v>=0 else None)
+                        batch.append((sid,dt.isoformat(),*values)); count+=1
+                        if len(batch)>=10000:
+                            con.executemany(sql,batch); batch.clear()
+                        if count%100000==0: progress(f'{year}년 {Path(member).name}: {count:,}시간행 처리')
+                    if not count: raise ValueError(f'{member}: 해당 연도 시간자료가 없습니다.')
+                    con.executemany(sql,batch)
+                    con.executemany('INSERT OR REPLACE INTO stations VALUES(?,?)',metas.items())
+                    con.execute('INSERT INTO done VALUES(?)',(member,)); con.commit()
+                except Exception:
+                    con.rollback(); raise
+        # Process one station/year at a time; never load nationwide hourly rows together.
+        stations = con.execute('SELECT id,meta FROM stations ORDER BY id').fetchall()
+        output=[]
+        for i,(sid,meta) in enumerate(stations,1):
+            if i%20==1: progress(f'{year}년 전국 일별 판정: 측정소 {i}/{len(stations)}')
+            h = pd.read_sql_query('SELECT t AS 일시,p10 AS PM10,p25 AS PM25 FROM hours WHERE sid=? ORDER BY t',con,params=(sid,))
+            d = _pm_compact_hourly(h,year,year)
+            for key,value in json.loads(meta).items(): d[key]=value
+            output.append(d)
+        if not output: raise ValueError('전국 측정소 자료가 없습니다.')
+        d = pd.concat(output,ignore_index=True)
+        _pm_atomic_pickle(d,_pm_national_path(year))
+    finally:
+        con.close()
+    # Completed source can always be rebuilt from the original ZIP.
+    stage.unlink(missing_ok=True)
+
+
+def _pm_national_backup(start,end):
+    import json
+    buffer=io.BytesIO(); years=[]; missing=[]
+    with zipfile.ZipFile(buffer,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+        for year in range(int(start),int(end)+1):
+            if not _pm_national_ready(year): missing.append(year); continue
+            d=pd.read_pickle(_pm_national_path(year))
+            with z.open(f'{year}.csv','w',force_zip64=True) as f:
+                with io.TextIOWrapper(f,encoding='utf-8',newline='') as out:
+                    d[['날짜']+_PM_NATIONAL_META+_PM_NATIONAL_NUM].to_csv(out,index=False)
+            if z.getinfo(f'{year}.csv').file_size>256*1024**2 or sum(i.file_size for i in z.infolist())>2*1024**3-100000:
+                raise ValueError('복원 가능한 자료 용량을 초과합니다. 포함 기간을 줄여주세요.')
+            years.append(year)
+            if buffer.tell()>180*1024**2:
+                raise ValueError('전국 백업이 180MB를 초과합니다. 이 서버에서 한 파일로 안전하게 제공하기 어려운 용량입니다.')
+        if not years: raise ValueError('먼저 전국 계산자료 준비를 실행하세요.')
+        z.writestr('manifest.json',json.dumps({'format':_PM_NATIONAL_FORMAT,'rule':_PM_NATIONAL_RULE,'years':years,'missing_years':missing},ensure_ascii=False))
+    return buffer.getvalue(),years,missing
+
+
+def _pm_restore_national(upload):
+    import json
+    upload.seek(0)
+    AIRKOREA_FINAL_DIR.mkdir(parents=True,exist_ok=True)
+    with zipfile.ZipFile(upload) as z, tempfile.TemporaryDirectory(dir=AIRKOREA_FINAL_DIR) as td:
+        infos=z.infolist()
+        if len(infos)>151 or len({i.filename for i in infos})!=len(infos) or sum(i.file_size for i in infos)>2*1024**3:
+            raise ValueError('백업 파일 수 또는 용량이 올바르지 않습니다.')
+        if z.getinfo('manifest.json').file_size>100000: raise ValueError('설명 파일이 너무 큽니다.')
+        m=json.loads(z.read('manifest.json'))
+        if m.get('format')!=_PM_NATIONAL_FORMAT or m.get('rule')!=_PM_NATIONAL_RULE:
+            raise ValueError('현재 산정 기준으로 만든 전국 백업 파일을 선택하세요.')
+        years=m.get('years',[])
+        if not years or any(type(y)!=int or not AIRKOREA_FIRST_YEAR<=y<=pd.Timestamp.now().year for y in years) or len(set(years))!=len(years):
+            raise ValueError('백업 연도가 올바르지 않습니다.')
+        if set(z.namelist())!={'manifest.json'}|{f'{y}.csv' for y in years}: raise ValueError('예상하지 않은 파일이 있습니다.')
+        for year in years:
+            if z.getinfo(f'{year}.csv').file_size>256*1024**2: raise ValueError('연도별 자료가 너무 큽니다.')
+            with z.open(f'{year}.csv') as f: d=pd.read_csv(f,dtype=str,keep_default_na=False)
+            required=['날짜']+_PM_NATIONAL_META+_PM_NATIONAL_NUM
+            if d.empty or set(d.columns)!=set(required): raise ValueError('필수 열이 없거나 잘못된 열이 있습니다.')
+            d['날짜']=pd.to_datetime(d['날짜'],errors='coerce')
+            if d['날짜'].isna().any() or not d['날짜'].dt.year.eq(year).all() or not d['날짜'].eq(d['날짜'].dt.normalize()).all(): raise ValueError('측정 날짜 오류')
+            if d['측정소명'].str.strip().eq('').any() or d.duplicated(['지역','망','측정소명','날짜']).any(): raise ValueError('측정소 누락 또는 중복 날짜')
+            for c in _PM_NATIONAL_NUM:
+                v=pd.to_numeric(d[c],errors='coerce'); endpoint=c.endswith(('첫값','끝값'))
+                bad=(d[c].ne('') if endpoint else pd.Series(True,index=d.index)) & (v.isna()|~np.isfinite(v)|v.lt(0))
+                if not endpoint:
+                    maximum=24 if c.endswith('유효시간') else 1
+                    bad |= v.gt(maximum) | v.mod(1).ne(0)
+                if bad.any(): raise ValueError(f'{year}년 {c} 값 오류')
+                d[c]=v
+            if (d['공동유효시간']>d[['PM10유효시간','PM25유효시간']].min(axis=1)).any(): raise ValueError('유효시간 불일치')
+            d.to_pickle(Path(td)/f'{year}.pkl')
+        # Validate all years before publishing. No archive extraction or uploaded pickle.
+        for year in years:
+            os.replace(Path(td)/f'{year}.pkl',_pm_national_path(year))
+    return sorted(years)
+
+
+def _airkorea_backup_ui(label,start,end):
+    import hashlib
+    with st.expander('💾 전국 계산자료 PC 백업·복원',expanded=False):
+        st.caption('선택한 연도의 전국 모든 측정소를 한 파일로 백업합니다. 원본 ZIP·시간별 농도 전체는 제외하며, 일별 판정과 결측 정보가 저장됩니다. 실제 경보 발령 이력이 아닌 농도 기준 판정입니다.')
+        upload=st.file_uploader('전국 백업 ZIP 선택(자동 복원)',type=['zip'],key='pm_national_restore_v1')
+        if upload is not None:
+            identity=(upload.name,upload.size,getattr(upload,'file_id',None))
+            saved=st.session_state.get('_pm_national_restored')
+            if not saved or saved[0]!=identity or not all(_pm_national_ready(y) for y in saved[1]):
+                try:
+                    with st.spinner('전국 계산자료 복원 중...'): years=_pm_restore_national(upload)
+                    st.session_state['_pm_national_restored']=(identity,years)
+                    st.success(f'전국 복원 완료: {_year_list_text(years)}년. 지역·측정소를 선택해 계산하세요.')
+                except Exception as exc: st.error(f'복원 실패: {exc}')
+            else: st.caption(f'전국 백업 사용 중: {_year_list_text(saved[1])}년')
+        st.caption('최초 준비에는 원본 전국 ZIP이 필요합니다. 아래 버튼은 없는 ZIP도 자동 수집하고 전국 자료를 처리합니다. 완료한 연도와 월파일은 재사용합니다. 처음에는 시간이 오래 걸립니다.')
+        if st.button('선택 기간 전국 계산자료 준비',key='pm_national_prepare_v1'):
+            progress=st.empty(); failures=[]
+            for year in range(int(start),int(end)+1):
+                try:
+                    if not _pm_national_ready(year):
+                        if not _airkorea_zip_is_valid(year)[0]:
+                            progress.caption(f'{year}년 전국 ZIP 다운로드 중...')
+                            _download_airkorea_final_year(year,headless=True,force=False)
+                        _pm_build_national_year(year,progress.caption)
+                except Exception as exc: failures.append(f'{year}: {exc}')
+            progress.empty()
+            if failures:
+                st.warning('일부 연도는 준비되지 않았습니다. 다음 실행 시 다시 시도합니다.')
+                st.text('\n'.join(failures))
+            else: st.success('선택 기간 전국 계산자료 준비 완료')
+        ready=[y for y in range(int(start),int(end)+1) if _pm_national_ready(y)]
+        st.caption(f'전국 준비: {len(ready)}/{int(end)-int(start)+1}개년 · {_year_list_text(ready)}')
+        if st.button('전국 백업 파일 만들기',key='pm_national_make_v1'):
             try:
-                with st.spinner('PC 저장용 백업 압축 중...'):
-                    data,years=_airkorea_make_backup(label,start,end)
-                st.session_state['_pm_backup_download_v1']=(key,data,years)
-            except Exception as exc:
-                st.error(f'백업 생성 실패: {exc}')
-        saved=st.session_state.get('_pm_backup_download_v1')
-        if saved and saved[0]==key:
-            st.download_button('지역자료 백업 다운로드(내 PC 저장)', data=saved[1],
-                file_name=f'airkorea_region_backup_{start}_{end}.zip',mime='application/zip',key='pm_backup_download_v1')
-            st.caption(f'포함 연도: {_year_list_text(saved[2])} / {len(saved[1])/1024/1024:.1f}MB. 다운로드 버튼까지 눌러야 PC에 저장됩니다.')
+                with st.spinner('전국 백업 압축 중...'): result=_pm_national_backup(start,end)
+                signature=tuple((y,_pm_national_path(y).stat().st_mtime_ns) for y in result[1])
+                st.session_state['_pm_national_download']=(int(start),int(end),signature,result)
+            except Exception as exc: st.error(f'백업 생성 실패: {exc}')
+        saved=st.session_state.get('_pm_national_download')
+        if saved and saved[:2]==(int(start),int(end)):
+            signature=tuple((y,_pm_national_path(y).stat().st_mtime_ns) for y in ready)
+            if signature==saved[2]:
+                data,years,missing=saved[3]
+                st.download_button('전국 백업 다운로드(내 PC 저장)',data=data,file_name=f'airkorea_national_{start}_{end}.zip',mime='application/zip',key='pm_national_download_v1')
+                st.caption(f'{len(data)/1024**2:.1f}MB · {_year_list_text(years)}년. 복원 후 다른 지역에서도 사용 가능합니다.')
+                if missing: st.warning(f'백업 제외(미준비): {_year_list_text(missing)}년. 이 연도는 별도 준비가 필요합니다.')
+        st.caption('기준 농도·연속시간을 변경하려면 원본으로 다시 준비해야 합니다. 백업은 최대 180MB까지 지원하며 실제 크기는 포함 연도·측정소 수에 따라 달라집니다.')
 
 
 def _airkorea_region_cache_inventory_v28(
@@ -8324,6 +8600,9 @@ def _airkorea_station_catalog(df: pd.DataFrame) -> pd.DataFrame:
             x[c] = ""
 
     x["PM10유효"] = pd.to_numeric(x["PM10"], errors="coerce").notna() & pd.to_numeric(x.get("PM25",pd.Series(np.nan,index=x.index)), errors="coerce").notna()
+    if '_전국일별' in x:
+        compact=x['_전국일별'].eq(1)
+        x.loc[compact,'PM10유효']=x.loc[compact,'공동유효시간'].gt(0)
     x["자료연도"] = pd.to_datetime(x["날짜"], errors="coerce").dt.year
 
     rows = []
@@ -8366,7 +8645,7 @@ def _airkorea_station_catalog(df: pd.DataFrame) -> pd.DataFrame:
             "망": network,
             "주소": addr,
             "지역": region,
-            "자료건수": int(valid["PM10"].count()),
+            "자료건수": int(valid["공동유효시간"].fillna(1).sum()) if "공동유효시간" in valid else int(valid["PM10"].count()),
             "관측일수": int(valid["날짜"].nunique()),
             "보유연도수": len(years),
             "보유연도": _year_list_text(years),
@@ -8544,6 +8823,7 @@ def _airkorea_catalog_signature(selected_label, start_year, end_year):
     """File fingerprints invalidate only the changed regional cache."""
     rows = []
     for year in range(max(AIRKOREA_FIRST_YEAR, int(start_year)), int(end_year)+1):
+        _pm_national_materialize(year,selected_label)
         p = _airkorea_region_cache_path_v28(year, selected_label)
         zp = _airkorea_zip_path(year)
         try:
@@ -8843,8 +9123,8 @@ def collect_airkorea_final_pm10(
         valid = hy[pd.to_numeric(hy["PM10"], errors="coerce").notna()].copy()
 
         year_status_df.at[idx, "선택측정소"] = name
-        year_status_df.at[idx, "PM10유효건수"] = int(valid["PM10"].count())
-        year_status_df.at[idx, "PM25유효건수"] = int(pd.to_numeric(hy.get("PM25",pd.Series(dtype=float)),errors="coerce").notna().sum())
+        year_status_df.at[idx, "PM10유효건수"] = int(hy["PM10유효시간"].sum()) if "_전국일별" in hy and hy["_전국일별"].eq(1).all() else int(valid["PM10"].count())
+        year_status_df.at[idx, "PM25유효건수"] = int(hy["PM25유효시간"].sum()) if "_전국일별" in hy and hy["_전국일별"].eq(1).all() else int(pd.to_numeric(hy.get("PM25",pd.Series(dtype=float)),errors="coerce").notna().sum())
         year_status_df.at[idx, "관측일수"] = int(valid["날짜"].nunique())
 
         if int(row["지역자료건수"]) == 0:
@@ -8890,7 +9170,7 @@ def collect_airkorea_final_pm10(
         "message": (
             f"ZIP 또는 지역자료 {requested_count-len(missing_final)}/{requested_count}개년 확보 → "
             f"{name} 적용 / 판정 가능 월이 있는 연도 {len(station_ok_years)}/{requested_count}개년 / "
-            f"시간별 자료 {len(h):,}건"
+            f"{'일별 판정/혼합 자료' if '_전국일별' in h else '시간별 자료'} {len(h):,}건"
         ),
         "coverage": coverage,
         "station_key": station_key,
@@ -8909,7 +9189,7 @@ def collect_airkorea_final_pm10(
         "inventory": inventory_final,
         "daily": daily,
         "hourly_evidence": daily.attrs.get("hourly_evidence", pd.DataFrame()),
-        "source": "에어코리아 최종확정자료(전국 연도 ZIP)",
+        "source": "에어코리아 최종확정자료(전국 일별 판정 백업)" if "_전국일별" in h else "에어코리아 최종확정자료(전국 연도 ZIP)",
         "analysis_years": f"{start}~{end}",
     }
 
@@ -26469,7 +26749,7 @@ if workday_mode == "개정":
                         f"PM10·PM2.5 지역 빠른캐시: {_pm10_region_ready}/{_pm10_region_total}개년 생성"
                     )
         else:
-            st.caption("확보된 자료가 없습니다. 지역자료 백업을 복원하거나 연도 ZIP을 받아주세요.")
+            st.caption("확보된 자료가 없습니다. 전국 백업을 복원하거나 연도 ZIP을 받아주세요.")
 
         pm10_station_mode = st.radio(
             "PM10·PM2.5 측정소 선택 방식",
