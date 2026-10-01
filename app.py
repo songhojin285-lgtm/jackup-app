@@ -26722,6 +26722,7 @@ if workday_mode == "개정":
                 "따라서 사석공 기준 Hs≥0.8m는 실제 값에서 정확히 판정하고 0.5~1.0m 계급의 40% 추정은 하지 않습니다."
             )
             _wink_max_year = int(pd.Timestamp.now().year)
+            _wink_year_range_summary = st.empty()
             wink_year_range = st.slider(
                 "WINK 파랑 분석기간",
                 min_value=2001,
@@ -26729,6 +26730,12 @@ if workday_mode == "개정":
                 value=(int(_wink_default_start), int(_wink_default_end)),
                 key="wink_raw_year_range_v33",
                 help="이 기간을 변경하면 PM10 분석기간도 함께 변경됩니다. WINK 자료는 연도별로 나누어 조회합니다.",
+            )
+            _wink_year_range_summary.markdown(
+                f'<div style="text-align:center; font-size:0.9rem; margin-bottom:0.25rem;">'
+                f'선택 기간 <strong>총 {int(wink_year_range[1]) - int(wink_year_range[0]) + 1}년</strong>'
+                f' <span>({int(wink_year_range[0])}~{int(wink_year_range[1])}년)</span></div>',
+                unsafe_allow_html=True,
             )
             if st.button("🔄 WINK 관측지점 목록 새로고침", key="wink_station_catalog_refresh_v33", use_container_width=True):
                 try:
@@ -26827,12 +26834,19 @@ if workday_mode == "개정":
             st.session_state["_pm10_last_wave_years"] = _current_wave_years
         elif "pm10_final_year_range" not in st.session_state:
             st.session_state["pm10_final_year_range"] = (_pm10_default_start, _pm10_default_end)
+        _pm10_year_range_summary = st.empty()
         pm10_year_range = st.slider(
             "PM10·PM2.5 분석 연도",
             min_value=AIRKOREA_FIRST_YEAR,
             max_value=_pm10_max_year,
             key="pm10_final_year_range",
             help="파랑 분석기간을 변경하면 같은 기간으로 설정됩니다. 이후 이 바를 움직여 PM10·PM2.5 기간만 따로 조정할 수 있습니다.",
+        )
+        _pm10_year_range_summary.markdown(
+            f'<div style="text-align:center; font-size:0.9rem; margin-bottom:0.25rem;">'
+            f'선택 기간 <strong>총 {int(pm10_year_range[1]) - int(pm10_year_range[0]) + 1}년</strong>'
+            f' <span>({int(pm10_year_range[0])}~{int(pm10_year_range[1])}년)</span></div>',
+            unsafe_allow_html=True,
         )
         if _pm10_link_wave_years:
             st.caption("파랑 연도를 바꾸면 PM10·PM2.5도 함께 변경됩니다. PM10·PM2.5 바는 별도로 조정할 수 있습니다.")
