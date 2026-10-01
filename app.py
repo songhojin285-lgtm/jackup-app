@@ -25913,6 +25913,278 @@ def _report_write_windrose(root, table, status, station_name, start_year, end_ye
     write_block(2254,0,'전체기간')
 
 
+def _report_formula_aggregate(root, target, refs, operation="SUM", digits=2):
+    """빈 자료는 빈칸으로 유지하며 원자료 셀을 집계한다."""
+    expression = f"{operation}({refs})"
+    if digits is not None:
+        expression = f"ROUND({expression},{digits})"
+    _xlsx_set_cell(root, target, f'=IF(COUNT({refs})=0,"",{expression})')
+
+
+def _report_formula_link(root, target, source, factor=1, digits=2):
+    _xlsx_set_cell(root, target,
+                   f'=IF(ISNUMBER({source}),ROUND({source}*{factor},{digits}),"")')
+
+
+def _report_link_formulas(sheet, tables, specs, start_year, end_year,
+                          pm_frame, wave_frame, wave_status, wave_criterion,
+                          windrose_status, windrose_hourly, station_name):
+    """현재 자료 → 집계 → 작업일수 수식을 연결한다."""
+    ns = {"m": _XLSX_MAIN_NS}
+    col = _xlsx_col_letter
+    aggregate = _report_formula_aggregate
+    link = _report_formula_link
+    # 월별 입력값으로 연계·연평균과 기간 집계를 다시 계산한다.
+    for name, key, first, total, mode in specs:
+        root = sheet(name)
+        frame = tables.get(key, pd.DataFrame())
+        annual = next((c for c in ("연평균", "연합계", "연최대", "연최소")
+                       if c in frame.columns), "연평균")
+        operation = {"연평균": "AVERAGE", "연합계": "SUM", "연최대": "MAX", "연최소": "MIN"}[annual]
+        for r in range(first, first + 30):
+            aggregate(root, f"N{r}", f"B{r}:M{r}", operation, 1)
+        for c in range(2, 15):
+            letter = col(c)
+            # 일수 월평균은 작업일수 계산과 같은 소수 2자리로 연결한다.
+            aggregate(root, f"{letter}{total}", f"{letter}{first}:{letter}{first+29}",
+                      {"mean": "AVERAGE", "max": "MAX", "min": "MIN", "sum": "SUM"}[mode],
+                      2 if annual == "연합계" else 1)
+
+    for name in ("최대풍향및풍속", "순간최대풍향및풍속"):
+        root = sheet(name)
+        for r in range(4, 64, 2):
+            aggregate(root, f"N{r}", f"B{r}:M{r}", "MAX", 1)
+            _xlsx_set_cell(root, f"N{r+1}",
+                f'=IF(COUNT(B{r}:M{r})=0,"",INDEX(B{r+1}:M{r+1},1,MATCH(N{r},B{r}:M{r},0)))')
+        for c in range(2,15):
+            letter = col(c)
+            aggregate(root, f"{letter}64", f"{letter}4:{letter}63", "MAX", 1)
+            # 최대값이 같으면 첫 번째 관측 방향을 사용한다.
+            _xlsx_set_cell(root, f"{letter}65",
+                f'=IF(COUNT({letter}4:{letter}63)=0,"",INDEX({letter}5:{letter}64,MATCH({letter}64,{letter}4:{letter}63,0)))')
+    for c in range(2,18):
+        letter = col(c)
+        aggregate(sheet("풍향별최대풍속"), f"{letter}34", f"{letter}4:{letter}33", "MAX", 1)
+
+    pm = sheet("미세먼지")
+    pm_average = None
+    if not pm_frame.empty:
+        pm_average = 3 + len(pm_frame)
+        factor_row = pm_average + 3
+        source_header = factor_row + 2
+        _xlsx_set_cell(pm, f"A{factor_row}", "적용계수")
+        _xlsx_set_cell(pm, f"B{factor_row}", 0.5)
+        _xlsx_set_cell(pm, f"A{factor_row+1}", "월별 중복제외 기준 충족일수 (빈칸: 적용 제외, 0: 확인된 충족일 없음)")
+        for c, title in enumerate(pm_frame.columns,1):
+            _xlsx_set_cell(pm,f"{col(c)}{source_header}",title)
+        for r in range(4, pm_average):
+            source_row = source_header + r - 3
+            _xlsx_set_cell(pm,f"A{source_row}",pm_frame.iloc[r-4,0])
+            for c in range(2,14):
+                letter=col(c)
+                value=pm_frame.iloc[r-4,c-1]
+                _xlsx_set_cell(pm,f"{letter}{source_row}",None if _xlsx_is_empty(value) else float(value)/0.5)
+                _xlsx_set_cell(pm,f"{letter}{r}",f'=IF(ISNUMBER({letter}{source_row}),{letter}{source_row}*$B${factor_row},"")')
+            aggregate(pm,f"N{source_row}",f"B{source_row}:M{source_row}","SUM",None)
+            aggregate(pm, f"N{r}", f"B{r}:M{r}", "SUM", None)
+        for c in range(2,15):
+            letter = col(c)
+            aggregate(pm, f"{letter}{pm_average}", f"{letter}4:{letter}{pm_average-1}", "AVERAGE", None)
+        dim=pm.find("m:dimension",ns)
+        if dim is not None: dim.set("ref",f"A1:N{source_header+len(pm_frame)-1}")
+
+    # 파랑 표의 원시 출현횟수에서 합계·출현율·연간·월간 일수를 연결한다.
+    wave = sheet("파랑일수")
+    calculation_row = len(wave_frame) + 6
+    annual_ref = f"E{calculation_row+2}"
+    monthly_ref = f"E{calculation_row+3}"
+    for offset, label in enumerate(("기준 충족 횟수", "전체 유효 횟수", "연간 비작업일수", "월간 비작업일수")):
+        _xlsx_set_cell(wave, f"A{calculation_row+offset}", label)
+        merges=wave.find("m:mergeCells",ns)
+        if merges is None: merges=ET.SubElement(wave,f"{{{_XLSX_MAIN_NS}}}mergeCells")
+        ET.SubElement(merges,f"{{{_XLSX_MAIN_NS}}}mergeCell",{"ref":f"A{calculation_row+offset}:D{calculation_row+offset}"})
+        merges.set("count",str(len(merges)))
+
+    sum_positions = [i for i in range(len(wave_frame)) if str(wave_frame.iloc[i,0]).lower() == "sum"]
+    formula_cells = []
+    usable_matrix = False
+    if sum_positions and len(wave_frame.columns) >= 4:
+        total_row = 4 + sum_positions[0]
+        sum_col = len(wave_frame.columns)-1
+        total_cell = f"{col(sum_col)}{total_row}"
+        for r in range(4,total_row):
+            aggregate(wave, f"{col(sum_col)}{r}", f"B{r}:{col(sum_col-1)}{r}", "SUM", None)
+            _xlsx_set_cell(wave, f"{col(sum_col+1)}{r}", f'=IF({total_cell}>0,{col(sum_col)}{r}/{total_cell},"")')
+        for c in range(2,sum_col+1):
+            aggregate(wave, f"{col(c)}{total_row}", f"{col(c)}4:{col(c)}{total_row-1}", "SUM", None)
+            _xlsx_set_cell(wave, f"{col(c)}{total_row+1}", f'=IF({total_cell}>0,{col(c)}{total_row}/{total_cell},"")')
+        _xlsx_set_cell(wave, f"{col(sum_col+1)}{total_row}", f'=IF({total_cell}>0,1,"")')
+        dcm = "DCM" in wave_criterion or "지반개량" in wave_criterion
+        usable_matrix = True
+        for i in range(sum_positions[0]):
+            period = _wave_interval(str(wave_frame.iloc[i,0]))
+            for j in range(1,sum_col-1):
+                height = _wave_interval(str(wave_frame.columns[j]))
+                if height is None or period is None:
+                    usable_matrix = False
+                    continue
+                h0,h1 = height; t0,t1 = period
+                full = h0 >= 1.5 or (h0 >= 1 and t0 >= 8) if dcm else h0 >= .8
+                possible = h1 > 1.5 or (h1 > 1 and t1 > 8) if dcm else h1 > .8
+                if possible and not full:
+                    usable_matrix = False
+                if full:
+                    formula_cells.append(f"{col(j+1)}{i+4}")
+        # WINK DCM의 원시자료 분모에는 계급표 밖 주기가 포함될 수 있다.
+        if dcm and not (wave_status.get("pdf_result") or {}).get("frequency_table"):
+            usable_matrix = False
+        if usable_matrix and formula_cells:
+            aggregate(wave, f"E{calculation_row}", ",".join(formula_cells), "SUM", None)
+            link(wave, f"E{calculation_row+1}", total_cell, digits=0)
+    if not usable_matrix or not formula_cells:
+        # 요약 PDF·원시 DCM은 실제 산정에 사용한 입력값을 보존한다.
+        for offset,key in ((0,"nonwork_count"),(1,"total_count")):
+            _xlsx_set_cell(wave, f"E{calculation_row+offset}", wave_status.get(key))
+    if wave_status.get("ok"):
+        if usable_matrix and formula_cells or (wave_status.get("total_count") and wave_status.get("nonwork_count") is not None):
+            _xlsx_set_cell(wave, annual_ref, f'=IF(E{calculation_row+1}>0,E{calculation_row}/E{calculation_row+1}*365,"")')
+        else:
+            _xlsx_set_cell(wave, annual_ref, wave_status.get("annual_days"))
+        _xlsx_set_cell(wave, monthly_ref, f'=IF(ISNUMBER({annual_ref}),{annual_ref}/12,"")')
+    else:
+        _xlsx_set_cell(wave, annual_ref, None)
+        _xlsx_set_cell(wave, monthly_ref, None)
+    # 새 계산행도 기존 보고서의 숫자 서식을 사용하여 긴 소수가 잘리지 않게 한다.
+    decimal_style = _xlsx_find_or_create_cell(sheet("작업불가능일수(기존)"), "F6").get("s")
+    count_style = _xlsx_find_or_create_cell(wave, "B4").get("s")
+    for offset in range(4):
+        style = count_style if offset < 2 else decimal_style
+        if style is not None:
+            _xlsx_find_or_create_cell(wave, f"E{calculation_row+offset}").set("s", style)
+    dim = wave.find("m:dimension",ns)
+    if dim is not None: dim.set("ref",f"A1:{col(max(5,len(wave_frame.columns)))}{calculation_row+3}")
+
+    revised = sheet("기상현상일수 (개정)")
+    # 기존 2004년 등 예시 근거표를 지우고 선택기간의 월별 일수로 교체한다.
+    for row in revised.find("m:sheetData",ns):
+        if int(row.get("r")) >= 19:
+            for cell in list(row): _xlsx_set_cell(revised,cell.get("r"),None)
+    source_specs = [("B","고온일수(33도이상)"),("D","저온일수(-12도이하)"),
+                    ("F","강수일수(10mm이상)"),("H","풍속일수(10m_s이상)"),
+                    ("J","신적설일수(5cm이상)"),("L","신적설일수(1cm이상)")]
+    by_year = {}
+    for letter,key in source_specs:
+        frame = tables.get(key,pd.DataFrame())
+        by_year[letter] = {int(r['연도']): r for _,r in frame.iterrows()} if '연도' in frame else {}
+    years = list(range(int(start_year),int(end_year)+1))
+    headers = {"B":"고온", "D":"저온", "F":"강우", "H":"풍속", "J":"강설 5cm", "L":"강설 1cm"}
+    for index,year in enumerate(years):
+        header = 19 + index*15
+        _xlsx_set_cell(revised,f"A{header}",year)
+        for letter,label in headers.items(): _xlsx_set_cell(revised,f"{letter}{header}",label)
+        for month in range(1,13):
+            r = header+month
+            _xlsx_set_cell(revised,f"A{r}",month)
+            for letter,_ in source_specs:
+                _xlsx_set_cell(revised,f"{letter}{r}",by_year[letter].get(year,{}).get(f"{month}월"))
+    for month in range(1,13):
+        r=month+3
+        for letter,_ in source_specs:
+            refs=','.join(f'{letter}{19+i*15+month}' for i in range(len(years)))
+            aggregate(revised,f"{letter}{r}",refs,"AVERAGE",2)
+        link(revised,f"N{r}",f"'안개일수'!{col(month+1)}34")
+        if pm_average:
+            link(revised,f"P{r}",f"'미세먼지'!{col(month+1)}{pm_average}",digits=8)
+        else: _xlsx_set_cell(revised,f"P{r}",None)
+        link(revised,f"R{r}",f"'파랑일수'!{monthly_ref}",digits=8)
+        # 해상·육상 강설을 이중 가산하지 않으므로 공통 합계는 두지 않는다.
+        _xlsx_set_cell(revised,f"T{r}",None)
+    for letter in ("B","D","F","H","J","L","N","P","R"):
+        aggregate(revised,f"{letter}16",f"{letter}4:{letter}15","SUM",2)
+    _xlsx_set_cell(revised,'A16','합계')
+    dim=revised.find('m:dimension',ns)
+    if dim is not None: dim.set('ref',f'A1:AG{max(528,19+len(years)*15)}')
+
+    month_columns=["K","P","U","Z","AE","AJ","AO","AT","AY","BD","BI","BN"]
+    old_sources=[("안개일수",34), ("안개일수",69), ("강설일수",34),
+                 ("뇌전일수",34), ("뇌전일수",69), ("기온일수",34)]
+    for name,is_new,final_start,annual_row in [("작업불가능일수(기존)",False,66,81),("작업불가능일수 (개정)",True,56,71)]:
+        root=sheet(name)
+        dest=["F","K","P","U","Z","AE"]+(["AJ","AO"] if is_new else [])
+        total="AT" if is_new else "AJ"
+        for land,first in [(False,6),(True,21)]:
+            for month in range(1,13):
+                r=first+month-1
+                for i,letter in enumerate(dest):
+                    if is_new:
+                        origin=["B","D","F","H","L" if land else "J","N","P","R"][i]
+                        if land and i==7: _xlsx_set_cell(root,f"{letter}{r}",0); continue
+                        link(root,f"{letter}{r}",f"'기상현상일수 (개정)'!{origin}{month+3}",.3 if i==5 else 1)
+                    else:
+                        source,row=old_sources[i]
+                        factor=([.3,.7,.7,.7,.3,.5] if land else [.3,.3,.3,.7,.7,.5])[i]
+                        link(root,f"{letter}{r}",f"'{source}'!{col(month+1)}{row}",factor)
+                refs=','.join(f'{letter}{r}' for letter in dest)
+                if is_new:
+                    # 미세먼지 판정 불가를 0일로 누락하지 않는다.
+                    _xlsx_set_cell(root,f'{total}{r}',f'=IF(COUNT({refs})<{len(dest)},"",ROUND(SUM({refs}),2))')
+                else: aggregate(root,f'{total}{r}',refs,'SUM',2)
+            for letter in dest+[total]: aggregate(root,f'{letter}{first+12}',f'{letter}{first}:{letter}{first+11}','SUM',2)
+        for r in range(38,48): aggregate(root,f'BS{r}',','.join(f'{c}{r}' for c in month_columns),'SUM',None)
+        for c in month_columns+['BS']: aggregate(root,f'{c}48',f'{c}38:{c}47','AVERAGE',None)
+        for month,c in enumerate(month_columns,1):
+            r=final_start+month-1
+            link(root,f'I{r}',f'{total}{month+5}')
+            link(root,f'P{r}',f'{total}{month+20}')
+            link(root,f'W{r}',f'{c}48',digits=8)
+            for target,climate in [('AH','I'),('AO','P')]:
+                _xlsx_set_cell(root,f'{target}{r}',f'=IF(COUNT({climate}{r},W{r},AA{r})=3,ROUND({climate}{r}*W{r}/AA{r},1),"")')
+            for target,climate,overlap in [('AV','I','AH'),('AZ','P','AO')]:
+                _xlsx_set_cell(root,f'{target}{r}',f'=IF(COUNT({climate}{r},W{r},{overlap}{r})=3,ROUND({climate}{r}+W{r}-{overlap}{r},1),"")')
+        total_row=final_start+12
+        for c in ['I','P','W','AA','AH','AO','AV','AZ']:
+            refs=f'{c}{final_start}:{c}{total_row-1}'
+            _xlsx_set_cell(root,f'{c}{total_row}',f'=IF(COUNT({refs})=12,ROUND(SUM({refs}),2),"")')
+        for column,nonwork in [('Q','AV'),('AG','AZ')]:
+            # 원본의 단위 표시는 유지하되 실제 계산용 값은 오른쪽 기존 보조셀에 둔다.
+            helper_row=annual_row+(column=='AG')
+            link(root,f'BI{helper_row}',f'{nonwork}{total_row}',digits=1)
+            _xlsx_set_cell(root,f'BF{helper_row}',365)
+            _xlsx_set_cell(root,f'BL{helper_row}',f'=IF(ISNUMBER(BI{helper_row}),ROUND(BF{helper_row}-BI{helper_row},1),"")')
+            _xlsx_set_cell(root,f'{column}{annual_row}',f'=IF(ISNUMBER(BL{helper_row}),BL{helper_row}&" 일/년","")')
+            _xlsx_set_cell(root,f'{column}{annual_row+2}',f'=IF(ISNUMBER(BL{helper_row}),ROUND(BL{helper_row}/12,1)&" 일/월","")')
+            _xlsx_set_cell(root,f'{column}{annual_row+4}',f'=IF(ISNUMBER(BL{helper_row}),ROUND(BL{helper_row}/365*100,1)/100,"")')
+            link(root,f'BF{helper_row+4}',f'BL{helper_row}',digits=1)
+            _xlsx_set_cell(root,f'BJ{helper_row+4}',365)
+            _xlsx_set_cell(root,f'BN{helper_row+4}',f'=IF(ISNUMBER(BF{helper_row+4}),BF{helper_row+4}/BJ{helper_row+4},"")')
+        if not is_new:
+            obs_columns=['F','K','P','U','Z','AE','AJ','AO','AT','AY','BD','BI']
+            sources=[old_sources[i] for i in [4,3,0,2,1,5]]
+            for offset,(source,row) in enumerate(sources,53):
+                for month,c in enumerate(obs_columns,1): link(root,f'{c}{offset}',f"'{source}'!{col(month+1)}{row}")
+                aggregate(root,f'BN{offset}',','.join(f'{c}{offset}' for c in obs_columns),'SUM',2)
+            for c in obs_columns+['BN']: aggregate(root,f'{c}59',f'{c}53:{c}58','SUM',2)
+
+    # 바람장미도 상단은 실제 월별 근거표의 관측수로 가중하여 연결한다.
+    if windrose_status.get('ok') and windrose_hourly is not None and not windrose_hourly.empty:
+        root=sheet('계급별 관측백분율')
+        for pi in range(5):
+            for si in range(4):
+                for c in range(5,22):
+                    letter=col(c); target=f'{letter}{5+pi*5+si}'
+                    if pi==4:
+                        link(root,target,f'{letter}{2303+si}',digits=2)
+                    else:
+                        rows=[2255+(pi*3+m)*4 for m in range(3)]
+                        denominator=','.join(f'W{r}' for r in rows)
+                        numerator='+'.join(f'IF(ISNUMBER(W{r}),{letter}{r+si}*W{r},0)' for r in rows)
+                        _xlsx_set_cell(root,target,f'=IF(SUM({denominator})=0,"",ROUND(({numerator})/SUM({denominator}),2))')
+                aggregate(root,f'V{5+pi*5+si}',f'E{5+pi*5+si}:U{5+pi*5+si}','SUM',2)
+            for c in range(5,23):
+                aggregate(root,f'{col(c)}{9+pi*5}',f'{col(c)}{5+pi*5}:{col(c)}{8+pi*5}','SUM',2)
+    return f"$A$1:${col(max(5,len(wave_frame.columns)))}${calculation_row+3}"
+
+
 def build_formatted_report_xlsx(
     template_bytes: bytes,
     station_name: str,
@@ -25940,6 +26212,9 @@ def build_formatted_report_xlsx(
     windrose_hourly=None,
 ) -> bytes:
     """기준 서식을 재사용하고 수집자료에 맞게 표의 행·열 및 값을 갱신한다."""
+    # 보고서에서 선택한 기간만 참조한다. 전체 조회기간의 다른 연도는 섞지 않는다.
+    tables = {name: _filter_year_period(frame, start_year, end_year)
+              for name, frame in tables.items()}
     input_buffer = io.BytesIO(template_bytes)
     output_buffer = io.BytesIO()
 
@@ -26068,7 +26343,8 @@ def build_formatted_report_xlsx(
         _report_write_summary(new_sheet, summary_rev_df, 71, 73, 75)
 
         # 서식의 예시값 대신 현재 수집 결과를 기록한다. 미수집 시에도 반드시 비운다.
-        pm_frame, pm_note = _report_pm10_export(pm10_monthly, pm10_status or {})
+        pm_frame, pm_note = _report_pm10_export(
+            _filter_year_period(pm10_monthly, start_year, end_year), pm10_status or {})
         wave_frame, wave_note = _report_wave_export(wave_status or {}, wave_display)
         live_areas = {}
         _report_write_windrose(sheet("계급별 관측백분율"), windrose_table,
@@ -26084,6 +26360,14 @@ def build_formatted_report_xlsx(
             live_areas["파랑별 출현율"] = _report_live_grid(
                 sheet("파랑별 출현율"), pd.DataFrame(columns=["파향", "출현횟수"]),
                 "파향별 출현율", "현재 산정은 파고×주기 표를 사용합니다. 파향별 자료 미산정(서식 예시값 삭제).", 20, 22)
+
+        live_areas["파랑일수"] = _report_link_formulas(
+            sheet, tables, year_table_specs, start_year, end_year,
+            pm_frame, wave_frame, wave_status or {}, wave_criterion,
+            windrose_status or {}, windrose_hourly, station_name)
+        if not pm_frame.empty:
+            live_areas["미세먼지"] = f"$A$1:$N${7+2*len(pm_frame)}"
+
 
         # workbook 전체를 XML로 재직렬화하지 않는다. Microsoft Excel이 요구하는
         # x15 namespace 선언을 보존한 채 재계산 속성만 문자 단위로 수정한다.
