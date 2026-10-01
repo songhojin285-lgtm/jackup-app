@@ -26395,70 +26395,71 @@ def calculate_workday_period_result(
 
 
 def sidebar_year_range_selector(mode: str, min_year: int, max_year: int) -> tuple[int, int]:
-    """기존/개정/바람장미도의 분석기간을 서로 독립적으로 저장하고 입력칸↔슬라이더를 동기화한다."""
+    """모드별 기간을 저장하고, 입력 연도를 보정하여 슬라이더와 동기화한다."""
     mode_key = {"기존": "old", "개정": "revised", "바람장미도": "windrose"}.get(mode, "common")
     start_key = f"{mode_key}_year_start_v50"
     end_key = f"{mode_key}_year_end_v50"
     slider_key = f"{mode_key}_year_slider_v50"
 
-    default_start = 1994
-    default_end = int(max_year)
-
-    if start_key not in st.session_state:
-        st.session_state[start_key] = default_start
-    if end_key not in st.session_state:
-        st.session_state[end_key] = default_end
-
-    # 연도가 바뀌거나 잘못된 값이 남아 있어도 안전하게 보정
-    st.session_state[start_key] = max(min_year, min(max_year, int(st.session_state[start_key])))
-    st.session_state[end_key] = max(min_year, min(max_year, int(st.session_state[end_key])))
-    if st.session_state[start_key] > st.session_state[end_key]:
-        st.session_state[end_key] = st.session_state[start_key]
-
-    if slider_key not in st.session_state:
-        st.session_state[slider_key] = (
-            int(st.session_state[start_key]),
-            int(st.session_state[end_key]),
-        )
+    def _bounded_year(value, fallback):
+        try:
+            year = int(value)
+        except (TypeError, ValueError, OverflowError):
+            year = int(fallback)
+        return max(int(min_year), min(int(max_year), year))
 
     def _inputs_to_slider():
-        s = int(st.session_state[start_key])
-        e = int(st.session_state[end_key])
+        s = _bounded_year(st.session_state.get(start_key), min_year)
+        e = _bounded_year(st.session_state.get(end_key), max_year)
         if s > e:
             e = s
-            st.session_state[end_key] = e
+        st.session_state[start_key] = s
+        st.session_state[end_key] = e
         st.session_state[slider_key] = (s, e)
 
     def _slider_to_inputs():
         s, e = st.session_state[slider_key]
-        st.session_state[start_key] = int(s)
-        st.session_state[end_key] = int(e)
+        st.session_state[start_key] = _bounded_year(s, min_year)
+        st.session_state[end_key] = _bounded_year(e, max_year)
+
+    # 콜백 실행 후, 위젯 생성 전에 저장값과 범위 변경을 함께 보정한다.
+    _inputs_to_slider()
 
     st.sidebar.markdown("**관측년도**")
     c1, c2 = st.sidebar.columns(2)
+    # 브라우저의 min/max 검증은 잘못 입력한 값을 서버에 전달하지 않는다.
+    # 입력칸에는 범위를 걸지 않고 콜백에서 보정하여 슬라이더 조작을 막지 않는다.
     c1.number_input(
         "시작연도",
-        min_value=int(min_year),
-        max_value=int(max_year),
         step=1,
+        format="%d",
         key=start_key,
         on_change=_inputs_to_slider,
     )
     c2.number_input(
         "종료연도",
-        min_value=int(min_year),
-        max_value=int(max_year),
         step=1,
+        format="%d",
         key=end_key,
         on_change=_inputs_to_slider,
     )
+    st.sidebar.caption(f"입력 가능: {min_year}~{max_year}년 · 범위 밖 연도는 자동 보정")
 
+    s, e = st.session_state[slider_key]
+    st.sidebar.markdown("**조회 기간**")
+    st.sidebar.markdown(
+        f'<div style="text-align:center; font-size:0.9rem; margin-bottom:0.25rem;">'
+        f'선택 기간 <strong>총 {int(e) - int(s) + 1}년</strong>'
+        f' <span>({int(s)}~{int(e)}년)</span></div>',
+        unsafe_allow_html=True,
+    )
     st.sidebar.slider(
         "조회 기간",
         min_value=int(min_year),
         max_value=int(max_year),
         key=slider_key,
         on_change=_slider_to_inputs,
+        label_visibility="collapsed",
     )
 
     s, e = st.session_state[slider_key]
