@@ -26757,6 +26757,367 @@ def sidebar_year_range_selector(mode: str, min_year: int, max_year: int) -> tupl
 # ----------------------------------------------------------------------------
 # A. 산정 화면 선택 — 사이드바 최상단에서 먼저 선택
 # ----------------------------------------------------------------------------
+# Excel 재사용 v1: 결과표와 별도로 검증 가능한 입력 자료를 보관한다.
+# API 키, 원본 ZIP, pickle은 Excel에 저장하지 않는다.
+_RX_SCHEMA = 1
+_RX_SHEET = '_재사용자료_v1'
+_RX_NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+
+
+def _rx_store():
+    return st.session_state.setdefault('_excel_reuse_data_v1', {})
+
+
+def _rx_key(kind, identity):
+    return json.dumps([kind, identity], ensure_ascii=False, sort_keys=True)
+
+
+def _rx_encode(obj):
+    if isinstance(obj, pd.DataFrame):
+        frame = obj.copy(); frame.attrs = {}
+        return {'@': 'frame', 'data': frame.to_json(orient='split', date_format='iso', double_precision=15),
+                'datetime': [str(c) for c in frame if pd.api.types.is_datetime64_any_dtype(frame[c])],
+                'attrs': _rx_encode(obj.attrs)}
+    if isinstance(obj, pd.Series):
+        return {'@': 'series', 'frame': _rx_encode(obj.to_frame()), 'name': _rx_encode(obj.name)}
+    if isinstance(obj, dict):
+        return {'@': 'dict', 'items': [[_rx_encode(k), _rx_encode(v)] for k, v in obj.items()
+                if str(k).lower() not in {'api_key', 'servicekey', 'service_key', 'token'}]}
+    if isinstance(obj, (list, tuple, set)):
+        return {'@': 'tuple' if isinstance(obj, tuple) else 'list', 'items': [_rx_encode(v) for v in obj]}
+    if isinstance(obj, (pd.Timestamp, np.datetime64)):
+        return {'@': 'time', 'value': str(obj)}
+    if isinstance(obj, np.generic):
+        return _rx_encode(obj.item())
+    if obj is pd.NA or obj is pd.NaT: return None
+    if isinstance(obj, float) and not np.isfinite(obj): return None
+    if isinstance(obj, str):
+        return re.sub(r'(?i)((?:servicekey|api_key|authkey|access_token)=)[^&\s]+', r'\1[REDACTED]', obj)
+    if obj is None or isinstance(obj, (int, float, bool)): return obj
+    return str(obj)
+
+
+def _rx_decode(obj):
+    if not isinstance(obj, dict): return obj
+    tag = obj.get('@')
+    if tag == 'frame':
+        frame = pd.read_json(io.StringIO(obj['data']), orient='split', convert_dates=False, dtype=False)
+        for c in obj.get('datetime', []):
+            if c in frame: frame[c] = pd.to_datetime(frame[c], errors='coerce')
+        frame.attrs = _rx_decode(obj.get('attrs', {'@': 'dict', 'items': []}))
+        return frame
+    if tag == 'series':
+        series = _rx_decode(obj['frame']).iloc[:, 0]; series.name = _rx_decode(obj['name']); return series
+    if tag == 'dict': return {_rx_decode(k): _rx_decode(v) for k, v in obj['items']}
+    if tag in {'list', 'tuple'}:
+        values = [_rx_decode(v) for v in obj['items']]
+        return tuple(values) if tag == 'tuple' else values
+    if tag == 'time': return pd.Timestamp(obj['value'])
+    raise ValueError('지원하지 않는 재사용 자료 형식입니다.')
+
+
+def _rx_excel_bytes(raw):
+    """기존 XML/그림/서식을 변경하지 않고 숨김 입력자료 시트만 추가한다."""
+    data = json.dumps({'schema': _RX_SCHEMA, 'payload': _rx_encode(_rx_store())}, ensure_ascii=False, allow_nan=False)
+    # Each cell is below Excel's 32767 UTF-16 code unit limit, including emoji.
+    chunks = [data[i:i+12000] for i in range(0, len(data), 12000)]
+    root = ET.Element('worksheet', xmlns=_RX_NS)
+    rows = ET.SubElement(root, 'sheetData')
+    for i, chunk in enumerate(chunks, 1):
+        row = ET.SubElement(rows, 'row', r=str(i))
+        cell = ET.SubElement(row, 'c', r=f'A{i}', t='inlineStr')
+        ET.SubElement(ET.SubElement(cell, 'is'), 't').text = chunk
+    relns = 'http://schemas.openxmlformats.org/package/2006/relationships'
+    docrel = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+    ctns = 'http://schemas.openxmlformats.org/package/2006/content-types'
+    output = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(raw)) as src, zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as dst:
+        book_raw = src.read('xl/workbook.xml').decode('utf-8')
+        book = ET.fromstring(book_raw)
+        rels = ET.fromstring(src.read('xl/_rels/workbook.xml.rels'))
+        types = ET.fromstring(src.read('[Content_Types].xml'))
+        sheets = book.find(f'{{{_RX_NS}}}sheets')
+        sid = max(int(s.get('sheetId')) for s in sheets) + 1
+        rid = 'rIdExcelReuse1'
+        if any(r.get('Id') == rid for r in rels): raise ValueError('재사용 시트가 이미 있습니다.')
+        target = 'worksheets/excel_reuse_v1.xml'
+        ET.SubElement(sheets, f'{{{_RX_NS}}}sheet', {'name': _RX_SHEET, 'sheetId': str(sid), 'state': 'hidden', f'{{{docrel}}}id': rid})
+        ET.SubElement(rels, f'{{{relns}}}Relationship', Id=rid, Type=docrel+'/worksheet', Target=target)
+        ET.SubElement(types, f'{{{ctns}}}Override', PartName='/xl/'+target,
+                      ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml')
+        replacements = {'xl/workbook.xml': re.sub(r'(</(?:[\w]+:)?sheets\s*>)',
+                lambda m: ET.tostring(list(sheets)[-1], encoding='unicode') + m.group(1), book_raw, count=1).encode('utf-8'),
+                        'xl/_rels/workbook.xml.rels': ET.tostring(rels, encoding='utf-8', xml_declaration=True),
+                        '[Content_Types].xml': ET.tostring(types, encoding='utf-8', xml_declaration=True)}
+        for item in src.infolist(): dst.writestr(item, replacements.get(item.filename, src.read(item)))
+        dst.writestr('xl/'+target, ET.tostring(root, encoding='utf-8', xml_declaration=True))
+    return output.getvalue()
+
+
+def _rx_read_excel(raw):
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        target = 'xl/worksheets/excel_reuse_v1.xml'
+        if target not in zf.namelist():
+            raise ValueError('이전 버전 Excel에는 재계산용 일별·시간별 자료가 없습니다. 수정된 앱으로 한 번 계산한 뒤 새 Excel을 다운로드해 주세요. 합계표를 원자료로 간주하지 않습니다.')
+        if zf.getinfo(target).file_size > 400 * 1024**2:
+            raise ValueError('재사용 자료가 허용 크기(400MB)를 초과합니다.')
+        root = ET.fromstring(zf.read(target))
+        text = ''.join(el.text or '' for el in root.findall(f'.//{{{_RX_NS}}}t'))
+        doc = json.loads(text)
+    if doc.get('schema') != _RX_SCHEMA: raise ValueError('재사용 자료 버전이 다릅니다.')
+    result = _rx_decode(doc['payload'])
+    if not isinstance(result, dict): raise ValueError('재사용 자료 형식 오류')
+    for key, entry in result.items():
+        if not isinstance(entry, dict) or not {'kind', 'identity', 'years', 'frame', 'status'} <= entry.keys():
+            raise ValueError('재사용 자료 항목이 손상되었습니다.')
+        if not isinstance(entry['frame'], pd.DataFrame): raise ValueError('입력 자료 표가 없습니다.')
+        if key != _rx_key(entry['kind'], entry['identity']): raise ValueError('지점 식별정보가 일치하지 않습니다.')
+    return result
+
+
+def _rx_upload_ui():
+    with st.sidebar.expander('📂 이전 결과 Excel 재사용', expanded=True):
+        upload = st.file_uploader('이 앱에서 다운로드한 결과 Excel', type=['xlsx'], key='result_excel_reuse_upload')
+        enabled = st.checkbox('저장된 연도 자료 우선 사용', value=True, key='result_excel_reuse_enabled')
+        st.caption('동일 지점·자료원·기준의 자료만 재사용합니다. 부족한 연도는 기존 방식으로 수집합니다. 저장 당시의 결측값은 유지됩니다. 최신 자료로 갱신하려면 우선 사용을 해제하세요.')
+        if upload is not None and enabled:
+            import hashlib
+            raw = upload.getvalue(); digest = hashlib.sha256(raw).hexdigest()
+            if st.session_state.get('_rx_loaded_digest') != digest:
+                try:
+                    loaded = _rx_read_excel(raw)
+                    st.session_state['_excel_reuse_data_v1'] = loaded
+                    st.session_state['_rx_loaded_digest'] = digest
+                    st.session_state.pop('shared_windrose_results_v1', None)
+                except Exception as exc:
+                    st.warning(str(exc))
+                    st.session_state['_excel_reuse_data_v1'] = {}
+                    st.session_state.pop('_rx_loaded_digest', None)
+            if st.session_state.get('_rx_loaded_digest') == digest:
+                st.success('Excel 재사용 자료를 불러왔습니다.')
+        if st.button('불러온 재사용 자료 비우기', key='rx_clear'):
+            st.session_state['_excel_reuse_data_v1'] = {}
+            st.session_state.pop('_rx_loaded_digest', None)
+            st.session_state.pop('shared_windrose_results_v1', None)
+            st.caption('업로드한 파일도 오른쪽 ×로 제거하면 다음 실행부터 다시 불러오지 않습니다.')
+        entries = _rx_store().values()
+        if entries:
+            st.dataframe(pd.DataFrame([{'자료': e['kind'], '지점': str(e['identity'][0]),
+                    '저장 연도': ', '.join(map(str, e['years']))} for e in entries]), hide_index=True)
+
+
+def _rx_entry(kind, identity):
+    if not st.session_state.get('result_excel_reuse_enabled', True): return None
+    return _rx_store().get(_rx_key(kind, identity))
+
+
+def _rx_years(frame):
+    if frame is None or frame.empty: return pd.Series(dtype=float)
+    if '연도' in frame: return pd.to_numeric(frame['연도'], errors='coerce')
+    if '조회연도' in frame: return pd.to_numeric(frame['조회연도'], errors='coerce')
+    for col in ['일시', '날짜']:
+        if col in frame: return pd.to_datetime(frame[col], errors='coerce').dt.year
+    return pd.Series(np.nan, index=frame.index)
+
+
+def _rx_slice(frame, years):
+    if frame is None: return pd.DataFrame()
+    return frame.loc[_rx_years(frame).isin(years)].copy()
+
+
+def _rx_concat(frames):
+    clean = []
+    for f in frames:
+        if isinstance(f, pd.DataFrame) and not f.empty:
+            f = f.copy(); f.attrs = {}; clean.append(f)
+    return pd.concat(clean, ignore_index=True) if clean else pd.DataFrame()
+
+
+def _rx_groups(years):
+    groups = []
+    for y in sorted(set(map(int, years))):
+        if groups and y == groups[-1][1]+1: groups[-1][1] = y
+        else: groups.append([y, y])
+    return groups
+
+
+def _rx_plan(kind, identity, start, end, force=False):
+    entry = None if force else _rx_entry(kind, identity)
+    years = list(range(int(start), int(end)+1))
+    cached = sorted(set(years) & set(entry['years'])) if entry else []
+    missing = [y for y in years if y not in cached]
+    if cached: st.caption(f'{kind}: Excel/세션 재사용 {len(cached)}개년 ({_year_list_text(cached)})')
+    if missing: st.caption(f'{kind}: 추가 확인 {len(missing)}개년 ({_year_list_text(missing)})')
+    return entry, cached, missing
+
+
+def _rx_save(kind, identity, frame, status, years):
+    status = dict(status)
+    previous = _rx_store().get(_rx_key(kind, identity))
+    if previous:
+        replaced = set(_rx_years(frame).dropna().astype(int))
+        retained = set(previous['years']) - replaced
+        frame = _rx_concat([_rx_slice(previous['frame'], retained), frame])
+        years = sorted(set(map(int, years)) | retained)
+        for field in ['daily', 'year_status']:
+            if isinstance(status.get(field), pd.DataFrame):
+                status[field] = _rx_concat([_rx_slice(previous['status'].get(field, pd.DataFrame()), retained), status[field]])
+    _rx_store()[_rx_key(kind, identity)] = {'kind': kind, 'identity': identity,
+        'frame': frame.copy(), 'status': status, 'years': sorted(set(map(int, years))),
+        'saved_at': str(pd.Timestamp.now())}
+
+
+_rx_original_daily = fetch_daily_api
+
+def fetch_daily_api(stn_id, start_yr, end_yr, key):
+    identity = [int(stn_id)]
+    entry, cached, missing = _rx_plan('ASOS 일자료', identity, start_yr, end_yr)
+    frames = [_rx_slice(entry['frame'], cached)] if entry else []
+    status = {'ok_years': list(cached), 'no_data_years': [], 'error_years': [], 'error_messages': {}}
+    for a, b in _rx_groups(missing):
+        if not key:
+            st.error('추가 연도 ASOS 자료를 수집하려면 API Key를 입력하세요.'); st.stop()
+        data = _rx_original_daily(stn_id, a, b, key); frames.append(data)
+        info = data.attrs.get('asos_fetch_status', {})
+        for k in ['ok_years', 'no_data_years', 'error_years']: status[k].extend(info.get(k, []))
+        status['error_messages'].update(info.get('error_messages', {}))
+    result = _rx_concat(frames)
+    result.attrs['asos_fetch_status'] = status
+    _rx_save('ASOS 일자료', identity, result, status, status['ok_years'])
+    return result
+
+
+_rx_original_climate = build_climate_monthly
+_rx_original_ensure = ensure_climate_files_auto
+
+def ensure_climate_files_auto(selected_label, station_code, start_year, end_year, force_refresh=False, headless=True):
+    entry, cached, missing = _rx_plan('기후통계', [selected_label], start_year, end_year, force_refresh)
+    if force_refresh: _rx_store().pop(_rx_key('기후통계', [selected_label]), None)
+    result = {}
+    for a, b in _rx_groups(missing):
+        result.update(_rx_original_ensure(selected_label, station_code, a, b, force_refresh=force_refresh or bool(entry), headless=headless))
+        # CSV downloads may replace the previous file. Capture each gap before fetching the next.
+        frame, info = _rx_original_climate(selected_label, a, b)
+        cols = [c for c in frame if c.endswith('_월간')]
+        usable = _rx_years(frame.loc[frame[cols].notna().any(axis=1)]).dropna().astype(int).unique() if cols else []
+        _rx_save('기후통계', [selected_label], frame, info, usable)
+    return result
+
+
+def build_climate_monthly(selected_label, start_year, end_year):
+    entry, cached, missing = _rx_plan('기후통계', [selected_label], start_year, end_year)
+    frames = [_rx_slice(entry['frame'], cached)] if entry else []
+    status = dict(entry['status']) if entry else {}
+    for a, b in _rx_groups(missing):
+        data, newstatus = _rx_original_climate(selected_label, a, b)
+        frames.append(data)
+        for key, value in newstatus.items():
+            if value is not None: status[key] = value
+    result = _rx_concat(frames)
+    # An available year may contain officially unobserved months/phenomena; keep NaN.
+    valid = [c for c in result if c.endswith('_월간')]
+    years = _rx_years(result.loc[result[valid].notna().any(axis=1)]).dropna().astype(int).unique() if valid else []
+    status.setdefault('errors', [])
+    for k in ['fog', 'thunder', 'freezing']: status.setdefault(k, None)
+    _rx_save('기후통계', [selected_label], result, status, years)
+    return result, status
+
+
+_rx_original_wink = auto_fetch_wink_observation_yearly
+
+def auto_fetch_wink_observation_yearly(station_name, start_year, end_year, headless=True):
+    identity = [station_name]
+    entry, cached, missing = _rx_plan('WINK 원시파랑', identity, start_year, end_year)
+    frames = [_rx_slice(entry['frame'], cached)] if entry else []
+    rows = [{'연도': y, '상태': 'Excel 재사용'} for y in cached]
+    errors = []
+    for a, b in _rx_groups(missing):
+        info = _rx_original_wink(station_name, a, b, headless=headless)
+        if not info.get('ok'): errors.append(info.get('message', '수집 실패'))
+        frames.append(info.get('wave_df', pd.DataFrame()))
+        rows.extend(info.get('year_status', pd.DataFrame()).to_dict('records'))
+    frame = _rx_concat(frames)
+    years = _rx_years(frame).dropna().astype(int).unique().tolist()
+    status = {'ok': bool(years) and not errors, 'message': ' / '.join(errors) if errors else f'Excel 병합 파랑자료 {len(years)}개년',
+        'year_status': pd.DataFrame(rows), 'station_name': station_name, 'success_years': years}
+    if not frame.empty:
+        status.update(coverage_start=frame['일시'].min(), coverage_end=frame['일시'].max())
+    _rx_save('WINK 원시파랑', identity, frame, status, years)
+    return dict(status, wave_df=frame)
+
+
+_rx_original_wind = resolve_shared_windrose
+
+def resolve_shared_windrose(station_code, station_name, start_year, end_year, source, api_key, force=False):
+    identity = [int(station_code), station_name, source]
+    entry, cached, missing = _rx_plan('시간풍 자료', identity, start_year, end_year, force)
+    if force: _rx_store().pop(_rx_key('시간풍 자료', identity), None)
+    frames = [_rx_slice(entry['frame'], cached)] if entry else []
+    errors = []
+    for a, b in _rx_groups(missing):
+        hourly, table, status = _rx_original_wind(station_code, station_name, a, b, source, api_key, force)
+        frames.append(_rx_slice(hourly, range(a, b+1)))
+        info = status.get('source_status', {})
+        if not status.get('ok') or info.get('failed_years'): errors.append(status.get('message', str(info)))
+    frame = _rx_concat(frames)
+    table, status = build_windrose_occurrence_table(frame, station_name, start_year, end_year)
+    status.update(source_name=source, station_name=station_name, start_year=int(start_year), end_year=int(end_year))
+    if errors: status['source_status'] = {'message': ' / '.join(errors)}
+    # Failed/partial remote responses are not certified as reusable years.
+    years = _rx_years(frame).dropna().astype(int).unique().tolist() if not errors else cached
+    _rx_save('시간풍 자료', identity, frame, status, years)
+    return frame, table, status
+
+
+_rx_original_pm = collect_airkorea_final_pm10
+
+def collect_airkorea_final_pm10(selected_label, start_year, end_year, preferred_code='', preferred_name='',
+        preferred_key='', manual_selection=False, auto_download=True, headless=True, force_retry_missing=False, allow_partial=False):
+    identity = [selected_label, str(preferred_key), bool(allow_partial), 'PM10_300_PM25_150_2h_union_x0.5_v1']
+    entry, cached, missing = _rx_plan('미세먼지', identity, max(2001, start_year), end_year, force_retry_missing)
+    frames = [_rx_slice(entry['frame'], cached)] if entry else []
+    status = dict(entry['status']) if entry else {}
+    daily = [_rx_slice(status.get('daily', pd.DataFrame()), cached)]
+    yearrows = [_rx_slice(status.get('year_status', pd.DataFrame()), cached)]
+    for a, b in _rx_groups(missing):
+        data, info = _rx_original_pm(selected_label, a, b, preferred_code=preferred_code, preferred_name=preferred_name,
+            preferred_key=preferred_key, manual_selection=manual_selection,
+            auto_download=auto_download or bool(entry), headless=headless,
+            force_retry_missing=force_retry_missing, allow_partial=allow_partial)
+        frames.append(data); daily.append(info.get('daily', pd.DataFrame())); yearrows.append(info.get('year_status', pd.DataFrame()))
+        status.update(info)
+    result = _rx_concat(frames)
+    usable = sorted(result.loc[result['경보자료확인일수'].gt(0), '연도'].astype(int).unique()) if not result.empty else []
+    # Keep confirmed partial-month flags, but do not cache a completely unavailable year as zero.
+    status.update(ok=bool(usable), daily=_rx_concat(daily), year_status=_rx_concat(yearrows),
+        unavailable_years=[y for y in range(max(2001, start_year), end_year+1) if y not in usable],
+        station_ok_years=usable, station_missing_years=[y for y in range(max(2001, start_year), end_year+1) if y not in usable],
+        analysis_years=f'{start_year}~{end_year}', message=f'Excel/기존 자료 병합: 판정 가능 {len(usable)}개년 · {preferred_name}')
+    status.setdefault('station_name', preferred_name)
+    _rx_save('미세먼지', identity, result, status, usable)
+    return result, status
+
+
+_rx_original_pm_sidebar = _pm_simple_sidebar
+
+def _pm_simple_sidebar(label, start, end):
+    matches = [e for e in _rx_store().values() if e['kind'] == '미세먼지' and e['identity'][0] == label
+               and e['years'] and st.session_state.get('result_excel_reuse_enabled', True)]
+    if matches and not st.checkbox('Excel에 없는 다른 측정소도 준비', key='rx_other_pm_station'):
+        rows = []
+        for e in matches:
+            s = e['status']; years = sorted(set(e['years']) & set(range(start, end+1)))
+            rows.append({'측정소키': e['identity'][1], '측정소명': s.get('station_name', ''),
+                '측정소코드': s.get('station_code', ''), '주소': s.get('station_addr', ''), '망': s.get('station_network', ''),
+                '보유연도수': len(years), '보유연도': ','.join(map(str, years))})
+        st.caption('Excel에 저장된 측정소를 사용합니다. 계산 시 부족한 연도만 기존 자료원에서 추가 확인합니다.')
+        return pd.DataFrame(rows).drop_duplicates('측정소키'), []
+    return _rx_original_pm_sidebar(label, start, end)
+
+
+_rx_upload_ui()
+
+
 st.sidebar.header("🧮 작업일수 산정")
 if "workday_mode" not in st.session_state:
     st.session_state["workday_mode"] = "기존"
@@ -27028,7 +27389,9 @@ if workday_mode == "개정":
                     pass
                 st.rerun()
 
-            wink_station_list_status = fetch_wink_observation_station_catalog()
+            wink_station_list_status = ({"stations": list(dict.fromkeys(list(WINK_STATION_FALLBACK) +
+                [e['identity'][0] for e in _rx_store().values() if e['kind'] == 'WINK 원시파랑']))}
+                if st.session_state.get('_rx_loaded_digest') else fetch_wink_observation_station_catalog())
             _wink_station_options = wink_station_list_status.get("stations", []) or list(WINK_STATION_FALLBACK)
             _recommended_station = _suggest_wink_station_name(station_name, _wink_station_options)
             _default_station_idx = _wink_station_options.index(_recommended_station) if _recommended_station in _wink_station_options else 0
@@ -27063,6 +27426,12 @@ if workday_mode == "개정":
                 key="wave_longterm_pdf_upload_v33",
                 help="텍스트가 포함된 PDF를 권장합니다. 스캔 이미지 PDF는 자동판독이 어려울 수 있습니다.",
             )
+            _pdf_saved = _rx_entry('장기파랑 PDF', [station_name])
+            if wave_pdf is None and _pdf_saved:
+                wave_pdf_parse = _pdf_saved['status']['parse']
+                wave_pdf_name = _pdf_saved['status']['name']
+                wave_pdf_bytes = b'excel-parsed-pdf'
+                st.caption(f"Excel의 장기파랑 PDF 판독자료 사용: {wave_pdf_name}")
             if wave_pdf is not None:
                 wave_pdf_bytes = wave_pdf.getvalue()
                 wave_pdf_name = wave_pdf.name
@@ -27450,9 +27819,9 @@ elif workday_mode == "개정":
     st.markdown("### 🆕 개정 작업일수 산정")
 
 if st.button("🚀 데이터 수집 및 엑셀 생성", type="primary"):
-    if not api_key_daily:
-        st.warning("⚠️ 좌측 사이드바에 공공데이터포털 API Key를 입력하세요.")
-        st.stop()
+    if wave_pdf_parse.get('ok'):
+        _rx_save('장기파랑 PDF', [station_name], pd.DataFrame(),
+                 {'parse': wave_pdf_parse, 'name': wave_pdf_name}, [])
 
     if workday_mode == "개정" and pm10_manual_station and not pm10_station_key:
         st.warning("직접선택을 사용하려면 지역자료 빠른 준비 후 측정소를 선택하세요.")
@@ -28522,7 +28891,7 @@ if st.button("🚀 데이터 수집 및 엑셀 생성", type="primary"):
         if formatted_report_bytes:
             st.download_button(
                 label=f"📥 {station_name} 기준서식 보고서 다운로드 (.xlsx)",
-                data=formatted_report_bytes,
+                data=_rx_excel_bytes(formatted_report_bytes),
                 file_name=(
                     f"{station_name}_{report_start_year}_{report_end_year}_"
                     "기초자료조사_기준서식.xlsx"
@@ -28677,7 +29046,7 @@ if st.button("🚀 데이터 수집 및 엑셀 생성", type="primary"):
 
         st.download_button(
             label=f"📄 {station_name} 원자료형 종합 분석 다운로드 (.xlsx)",
-            data=output.getvalue(),
+            data=_rx_excel_bytes(output.getvalue()),
             file_name=f"{station_name}_{workday_mode}_작업일수_종합분석.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             on_click="ignore",
