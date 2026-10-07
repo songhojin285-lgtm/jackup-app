@@ -25755,7 +25755,7 @@ def _report_pm10_export(monthly, status):
     if monthly is None or monthly.empty:
         return pd.DataFrame(columns=columns), "자료 없음 / 미세먼지를 수집한 뒤 다시 생성하세요."
     d=monthly.copy()
-    valid=pd.to_numeric(d.get("경보자료확인일수",pd.Series(0,index=d.index)),errors="coerce").gt(0)
+    valid=_lx_pm_valid(d)
     d.loc[~valid,"미세먼지_경보50퍼센트"]=np.nan
     d=d[d["연도"].isin(d.loc[valid,"연도"].unique())]
     frame=make_monthly_direct_pivot(d,"미세먼지_경보50퍼센트")
@@ -26877,7 +26877,7 @@ def _rx_read_excel(raw):
 
 def _rx_upload_ui():
     with st.sidebar.expander('📂 이전 결과 Excel 재사용', expanded=True):
-        upload = st.file_uploader('이 앱에서 다운로드한 결과 Excel', type=['xlsx'], key='result_excel_reuse_upload')
+        upload = st.file_uploader('기초자료조사 기준서식 또는 결과 Excel', type=['xlsx'], key='result_excel_reuse_upload')
         enabled = st.checkbox('저장된 연도 자료 우선 사용', value=True, key='result_excel_reuse_enabled')
         st.caption('동일 지점·자료원·기준의 자료만 재사용합니다. 부족한 연도는 기존 방식으로 수집합니다. 저장 당시의 결측값은 유지됩니다. 최신 자료로 갱신하려면 우선 사용을 해제하세요.')
         if upload is not None and enabled:
@@ -26885,8 +26885,15 @@ def _rx_upload_ui():
             raw = upload.getvalue(); digest = hashlib.sha256(raw).hexdigest()
             if st.session_state.get('_rx_loaded_digest') != digest:
                 try:
-                    loaded = _rx_read_excel(raw)
-                    st.session_state['_excel_reuse_data_v1'] = loaded
+                    with zipfile.ZipFile(io.BytesIO(raw)) as _z:
+                        _has_snapshot = 'xl/worksheets/excel_reuse_v1.xml' in _z.namelist()
+                    if _has_snapshot:
+                        loaded = _rx_read_excel(raw)
+                        st.session_state['_excel_reuse_data_v1'] = loaded
+                    else:
+                        report = _lx_parse_report(raw)
+                        st.session_state['_excel_reuse_data_v1'] = {}
+                        _lx_seed(report)
                     st.session_state['_rx_loaded_digest'] = digest
                     st.session_state.pop('shared_windrose_results_v1', None)
                 except Exception as exc:
@@ -26894,7 +26901,7 @@ def _rx_upload_ui():
                     st.session_state['_excel_reuse_data_v1'] = {}
                     st.session_state.pop('_rx_loaded_digest', None)
             if st.session_state.get('_rx_loaded_digest') == digest:
-                st.success('Excel 재사용 자료를 불러왔습니다.')
+                st.success('Excel 연도별 자료를 불러왔습니다.')
         if st.button('불러온 재사용 자료 비우기', key='rx_clear'):
             st.session_state['_excel_reuse_data_v1'] = {}
             st.session_state.pop('_rx_loaded_digest', None)
@@ -27087,7 +27094,7 @@ def collect_airkorea_final_pm10(selected_label, start_year, end_year, preferred_
         frames.append(data); daily.append(info.get('daily', pd.DataFrame())); yearrows.append(info.get('year_status', pd.DataFrame()))
         status.update(info)
     result = _rx_concat(frames)
-    usable = sorted(result.loc[result['경보자료확인일수'].gt(0), '연도'].astype(int).unique()) if not result.empty else []
+    usable = sorted(result.loc[_lx_pm_valid(result), '연도'].astype(int).unique()) if not result.empty else []
     # Keep confirmed partial-month flags, but do not cache a completely unavailable year as zero.
     status.update(ok=bool(usable), daily=_rx_concat(daily), year_status=_rx_concat(yearrows),
         unavailable_years=[y for y in range(max(2001, start_year), end_year+1) if y not in usable],
@@ -27114,6 +27121,401 @@ def _pm_simple_sidebar(label, start, end):
         return pd.DataFrame(rows).drop_duplicates('측정소키'), []
     return _rx_original_pm_sidebar(label, start, end)
 
+
+_LX_SPECS = [('평균기온', '평균기온', 5, 35, 'mean'), ('평균기온', '평균최고기온', 40, 70, 'mean'), ('평균최저기온', '평균최저기온', 4, 34, 'mean'), ('평균최저기온', '최고기온', 39, 69, 'max'), ('최저기온', '최저기온', 4, 34, 'min'), ('최저기온', '평균해면기압', 40, 70, 'mean'), ('최고해면기압', '최고해면기압', 4, 34, 'max'), ('최고해면기압', '최저해면기압', 39, 69, 'min'), ('평균상대습도', '평균상대습도', 5, 35, 'mean'), ('평균상대습도', '최소상대습도', 40, 70, 'min'), ('강수량', '강수량(24시간평균)', 5, 35, 'mean'), ('강수량', '1일최다강수량', 40, 70, 'max'), ('시간최다강수량', '1시간최다강수량', 4, 34, 'max'), ('시간최다강수량', '평균풍속', 40, 70, 'mean'), ('맑음일수', '맑음일수', 5, 35, 'mean'), ('맑음일수', '흐림일수', 40, 70, 'mean'), ('안개일수', '안개일수', 4, 34, 'mean'), ('안개일수', '강수일수(10mm이상)', 39, 69, 'mean'), ('강설일수', '강설일수', 4, 34, 'mean'), ('강설일수', '결빙일수', 39, 69, 'mean'), ('뇌전일수', '뇌전일수', 4, 34, 'mean'), ('뇌전일수', '폭풍일수(13.9m_s이상)', 39, 69, 'mean'), ('뇌전일수', '풍속일수(10m_s이상)', 75, 105, 'mean'), ('기온일수', '기온일수(-10도이하)', 4, 34, 'mean')]
+_LX_PIVOT_NAMES = {('고온_개정', 'sum', 'sum'): '고온일수(33도이상)', ('저온_개정', 'sum', 'sum'): '저온일수(-12도이하)', ('풍속_개정', 'sum', 'sum'): '풍속일수(10m_s이상)', ('강설5cm_개정', 'sum', 'sum'): '신적설일수(5cm이상)', ('강설1cm_개정', 'sum', 'sum'): '신적설일수(1cm이상)', ('평균기온', 'mean', 'mean'): '평균기온', ('최고기온', 'mean', 'mean'): '평균최고기온', ('최저기온', 'mean', 'mean'): '평균최저기온', ('최고기온', 'max', 'max'): '최고기온', ('최저기온', 'min', 'min'): '최저기온', ('평균해면기압', 'mean', 'mean'): '평균해면기압', ('최고해면기압', 'max', 'max'): '최고해면기압', ('최저해면기압', 'min', 'min'): '최저해면기압', ('평균상대습도', 'mean', 'mean'): '평균상대습도', ('최소상대습도', 'min', 'min'): '최소상대습도', ('일강수량', 'sum', 'mean'): '강수량(24시간평균)', ('일강수량', 'max', 'max'): '1일최다강수량', ('1시간최다강수량', 'max', 'max'): '1시간최다강수량', ('평균풍속', 'mean', 'mean'): '평균풍속', ('맑음일수', 'sum', 'sum'): '맑음일수', ('흐림일수', 'sum', 'sum'): '흐림일수', ('강수일수(10mm이상)', 'sum', 'sum'): '강수일수(10mm이상)', ('강설일수', 'sum', 'sum'): '강설일수', ('폭풍일수(13.9m/s이상)', 'sum', 'sum'): '폭풍일수(13.9m_s이상)', ('기온일수(-10도이하)', 'sum', 'sum'): '기온일수(-10도이하)'}
+
+def _lx_tables_from_daily(df_daily):
+    df_daily=df_daily.copy()
+    for c in ["최저해면기압", "최소상대습도"]:
+        if c in df_daily.columns:
+            df_daily[c] = df_daily[c].replace(0.0, np.nan)
+
+    df_daily["날짜"] = pd.to_datetime(
+        df_daily[["연도", "월", "일"]].rename(
+            columns={"연도": "year", "월": "month", "일": "day"}
+        ),
+        errors="coerce",
+    ).dt.strftime("%Y-%m-%d")
+
+    df_daily["맑음일수"] = (df_daily["평균전운량"] < 2.5).astype(int)
+    df_daily["흐림일수"] = (df_daily["평균전운량"] >= 7.5).astype(int)
+    df_daily["안개일수"] = (
+        df_daily["일기현상"].fillna("").astype(str).str.contains("안개", regex=False).astype(int)
+    )
+    df_daily["강수일수(10mm이상)"] = (df_daily["일강수량"] >= 10.0).astype(int)
+    df_daily["강설일수"] = (
+        df_daily["일기현상"].fillna("").astype(str).str.contains("눈", regex=False)
+        | (df_daily["적설"] > 0)
+    ).astype(int)
+    # 기존 기준의 폭풍일수: ASOS 일자료의 일 최대풍속(maxWs)이 13.9m/s 이상인 날.
+    # 최대풍속 자체가 미관측인 날은 0일이 아니라 결측값으로 유지한다.
+    _daily_max_wind = pd.to_numeric(df_daily["최대풍속"], errors="coerce")
+    df_daily["폭풍일수(13.9m/s이상)"] = np.where(
+        _daily_max_wind.notna(),
+        (_daily_max_wind >= 13.9).astype(float),
+        np.nan,
+    )
+    df_daily["기온일수(-10도이하)"] = (df_daily["최저기온"] <= -10.0).astype(int)
+    df_daily["폭풍"] = df_daily["폭풍일수(13.9m/s이상)"]
+
+    # 개정 작업일수 기준 (업로드된 기준표)
+    df_daily["고온_개정"] = (df_daily["최고기온"] >= 33.0).astype(int)
+    df_daily["저온_개정"] = (df_daily["최저기온"] <= -12.0).astype(int)
+    df_daily["강우_개정"] = (df_daily["일강수량"] >= 10.0).astype(int)
+    df_daily["풍속_개정"] = (df_daily["최대풍속"] >= 10.0).astype(int)
+    df_daily["강설5cm_개정"] = (df_daily["일최심신적설"] >= 5.0).astype(int)
+    df_daily["강설1cm_개정"] = (df_daily["일최심신적설"] >= 1.0).astype(int)
+
+
+    csv_wind_pivot=pd.DataFrame()
+    df_monthly=pd.DataFrame()
+    pm10_monthly=pd.DataFrame()
+    tables = {
+        "평균기온": make_pivot(df_daily, "평균기온", "mean", "mean"),
+        "평균최고기온": make_pivot(df_daily, "최고기온", "mean", "mean"),
+        "평균최저기온": make_pivot(df_daily, "최저기온", "mean", "mean"),
+        "최고기온": make_pivot(df_daily, "최고기온", "max", "max"),
+        "최저기온": make_pivot(df_daily, "최저기온", "min", "min"),
+        "평균해면기압": make_pivot(df_daily, "평균해면기압", "mean", "mean"),
+        "최고해면기압": make_pivot(df_daily, "최고해면기압", "max", "max"),
+        "최저해면기압": make_pivot(df_daily, "최저해면기압", "min", "min"),
+        "평균상대습도": make_pivot(df_daily, "평균상대습도", "mean", "mean"),
+        "최소상대습도": make_pivot(df_daily, "최소상대습도", "min", "min"),
+        "강수량(24시간평균)": make_pivot(df_daily, "일강수량", "sum", "mean"),
+        "1일최다강수량": make_pivot(df_daily, "일강수량", "max", "max"),
+        "1시간최다강수량": make_pivot(df_daily, "1시간최다강수량", "max", "max"),
+        "평균풍속": make_pivot(df_daily, "평균풍속", "mean", "mean"),
+        "최대풍속_및_풍향": make_wind_max_pivot(df_daily, "최대풍속", "최대풍속풍향"),
+        "순간최대풍속_및_풍향": make_wind_max_pivot(df_daily, "최대순간풍속", "최대순간풍속풍향"),
+        "풍향별_최대풍속": csv_wind_pivot if not csv_wind_pivot.empty else make_wind_dir_pivot(df_daily, "최대풍속", "최대풍속풍향"),
+        "풍향별_최대순간풍속": make_wind_dir_pivot(df_daily, "최대순간풍속", "최대순간풍속풍향"),
+        "맑음일수": make_pivot(df_daily, "맑음일수", "sum", "sum"),
+        "흐림일수": make_pivot(df_daily, "흐림일수", "sum", "sum"),
+        "안개일수": make_monthly_direct_pivot(df_monthly, "안개일수_월간"),
+        "강수일수(10mm이상)": make_pivot(df_daily, "강수일수(10mm이상)", "sum", "sum"),
+        "강설일수": make_pivot(df_daily, "강설일수", "sum", "sum"),
+        "결빙일수": make_monthly_direct_pivot(df_monthly, "결빙일수_월간"),
+        "뇌전일수": make_monthly_direct_pivot(df_monthly, "뇌전일수_월간"),
+        "폭풍일수(13.9m_s이상)": make_pivot(df_daily, "폭풍일수(13.9m/s이상)", "sum", "sum"),
+        "기온일수(-10도이하)": make_pivot(df_daily, "기온일수(-10도이하)", "sum", "sum"),
+    }
+
+    # 개정 현상일수 표를 현상일수 탭/엑셀에 추가
+    tables["고온일수(33도이상)"] = make_pivot(df_daily, "고온_개정", "sum", "sum")
+    tables["저온일수(-12도이하)"] = make_pivot(df_daily, "저온_개정", "sum", "sum")
+    tables["풍속일수(10m_s이상)"] = make_pivot(df_daily, "풍속_개정", "sum", "sum")
+    tables["신적설일수(5cm이상)"] = make_pivot(df_daily, "강설5cm_개정", "sum", "sum")
+    tables["신적설일수(1cm이상)"] = make_pivot(df_daily, "강설1cm_개정", "sum", "sum")
+    if not pm10_monthly.empty:
+        tables["미세먼지경보농도충족일수(50%적용)"] = make_monthly_direct_pivot(pm10_monthly, "미세먼지_경보50퍼센트")
+
+
+    return tables
+
+def _lx_pm_valid(frame):
+    known = pd.to_numeric(frame.get('경보자료확인일수', pd.Series(0,index=frame.index)), errors='coerce').gt(0)
+    saved = frame.get('Excel월자료유효',pd.Series(False,index=frame.index)).fillna(False).astype(bool)
+    return known | saved
+
+# 기준서식의 보이는 연월 집계표를 읽는다. 일자료로 역산하거나 날짜를 만들어내지 않는다.
+def _lx_number(v):
+    if isinstance(v, (int, float, np.number)) and not isinstance(v, bool): return float(v)
+    return np.nan
+
+
+def _lx_year(v):
+    m = re.fullmatch(r'(\d{4})(?:년)?', str(v or '').strip())
+    return int(m[1]) if m and 1900 <= int(m[1]) <= 2200 else None
+
+
+def _lx_parse_report(raw):
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    try:
+        if '기상개요' not in wb: raise ValueError('기상개요 시트가 있는 기준서식 Excel을 선택하세요.')
+        title = str(wb['기상개요']['A4'].value or '')
+        m = re.search(r'([^()]+)\((\d{2,3})\)\s*\((\d{4})[∼~～–-](\d{4})\)', title)
+        if not m: raise ValueError('기상개요 A4에서 관측지점 번호와 분석기간을 확인하지 못했습니다.')
+        label=f'{m[1].strip()}({m[2]})'; stn=int(m[2]); start,end=int(m[3]),int(m[4])
+        sheets={s.title:list(s.iter_rows(values_only=True)) for s in wb}
+        def cell(name,r,c):
+            rows=sheets.get(name,[])
+            return rows[r-1][c-1] if r<=len(rows) and c<=len(rows[r-1]) else None
+        tables={}
+        for sheet,name,first,last,mode in _LX_SPECS:
+            rows=[]
+            if sheet not in sheets: continue
+            # Verify header before reading only the designated source block (ignore old template remnants).
+            if str(cell(sheet,first-1,2)).strip()!='1월': continue
+            for r in range(first,last):
+                year=_lx_year(cell(sheet,r,1))
+                if year is None or not start<=year<=end:continue
+                rec={'연도':year,**{f'{i}월':_lx_number(cell(sheet,r,i+1)) for i in range(1,13)}}
+                rows.append(rec)
+            if rows:tables[name]=pd.DataFrame(rows)
+        for sheet,name in [('최대풍향및풍속','최대풍속_및_풍향'),('순간최대풍향및풍속','순간최대풍속_및_풍향')]:
+            rows=[]
+            for r in range(4,64,2):
+                y=_lx_year(cell(sheet,r,1))
+                if y is None or not start<=y<=end:continue
+                rec={'연도':y}
+                for i in range(1,13):
+                    v=_lx_number(cell(sheet,r,i+1));d=str(cell(sheet,r+1,i+1) or '')
+                    rec[f'{i}월']=f'{v} ({d})' if pd.notna(v) else np.nan
+                rows.append(rec)
+            if rows:tables[name]=pd.DataFrame(rows)
+        directions=['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW']
+        rows=[]
+        for r in range(4,34):
+            y=_lx_year(cell('풍향별최대풍속',r,1))
+            if y and start<=y<=end:rows.append({'연도':y,**{d:_lx_number(cell('풍향별최대풍속',r,c)) for c,d in enumerate(directions,2)}})
+        if rows:tables['풍향별_최대풍속']=pd.DataFrame(rows)
+        # Six revised thresholds are explicitly stored by year and month below the summary.
+        revnames=['고온일수(33도이상)','저온일수(-12도이하)','강수일수(10mm이상)','풍속일수(10m_s이상)','신적설일수(5cm이상)','신적설일수(1cm이상)']
+        for r,row in enumerate(sheets.get('기상현상일수 (개정)',[]),1):
+            y=_lx_year(row[0])
+            if y is None or not start<=y<=end or cell('기상현상일수 (개정)',r,2)!='고온':continue
+            if [cell('기상현상일수 (개정)',r+i,1) for i in range(1,13)]!=list(range(1,13)):continue
+            for c,name in zip([2,4,6,8,10,12],revnames):
+                rec={'연도':y,**{f'{i}월':_lx_number(cell('기상현상일수 (개정)',r+i,c)) for i in range(1,13)}}
+                if name not in tables:tables[name]=pd.DataFrame()
+                tables[name]=pd.concat([tables[name],pd.DataFrame([rec])],ignore_index=True).drop_duplicates('연도',keep='last')
+        if not tables:raise ValueError('재사용할 연도별 월자료 표가 없습니다.')
+        # PM formulas may have no cached values. Read the explicit raw-count block and factor instead.
+        pm=[];pm_note='';factor=None;pm_first=None
+        for r,row in enumerate(sheets.get('미세먼지',[]),1):
+            if str(row[0] or '').startswith('자료:'):pm_note=str(row[0])
+            if row[0]=='적용계수':factor=_lx_number(cell('미세먼지',r,2))
+            if str(row[0] or '').startswith('월별 중복제외 기준 충족일수'):pm_first=r+2
+        if pm_first and factor==0.5:
+            for r in range(pm_first,len(sheets['미세먼지'])+1):
+                y=_lx_year(cell('미세먼지',r,1))
+                if y is None:continue
+                for month in range(1,13):
+                    count=_lx_number(cell('미세먼지',r,month+1))
+                    pm.append({'연도':y,'월':month,'미세먼지_경보50퍼센트':count*factor,
+                        '경보자료확인일수':np.nan,'Excel월자료유효':bool(pd.notna(count)),'경보발령일수':count,
+                        '월상태':'Excel 집계값 적용' if pd.notna(count) else '판정불가(원본 빈칸)'})
+        pmname=pm_note.split(' / ')[1].strip() if ' / ' in pm_note else ''
+        # Wind percentages have per-month sample counts; retain percentages without inventing hourly observations.
+        wind=[];winddirs=['CALM','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW','N','소계']
+        for r,row in enumerate(sheets.get('계급별 관측백분율',[]),1):
+            y=_lx_year(row[1] if len(row)>1 else None)
+            if y is None or not start<=y<=end or cell('계급별 관측백분율',r,3)!='월':continue
+            for mi,month in enumerate([3,4,5,6,7,8,9,10,11,12,1,2]):
+                first=r+1+mi*4;n=_lx_number(cell('계급별 관측백분율',first,23))
+                if not np.isfinite(n) or n<=0:continue
+                for si in range(4):
+                    wind.append({'연도':y,'월':month,'계급번호':si,'관측수':n,
+                        **{d:_lx_number(cell('계급별 관측백분율',first+si,c)) for c,d in enumerate(winddirs,5)}})
+        # This report's wave matrix is a fixed PDF period, independent of the meteorological slider.
+        wave={};waveframe=pd.DataFrame();wavecols=[];waverows=[];note=''
+        for r,row in enumerate(sheets.get('파랑일수',[]),1):
+            if str(row[0] or '').startswith('자료:'):note=str(row[0])
+        if 'PDF' in note:
+            match=re.search(r'연간 파랑 비작업일수:\s*([\d.]+)',note)
+            if match:
+                wave={'ok':True,'annual_days':float(match[1]),'coverage':note,'source_file':note,
+                    'source_mode':'Excel에 저장된 장기파랑 PDF 집계표','message':'PDF 고정 분석기간 결과 재사용'}
+                for r,row in enumerate(sheets['파랑일수'],1):
+                    if row[0]=='주기(s) / 파고(m)':wavecols=list(row);continue
+                    if wavecols and isinstance(row[0],str) and re.match(r'^\d+\s*[~∼～-]\s*\d+',row[0]):
+                        waverows.append([row[0]]+[_lx_number(v) for v in row[1:len(wavecols)]])
+                if waverows:waveframe=pd.DataFrame(waverows,columns=wavecols)
+                if not waveframe.empty:
+                    bins=waveframe.iloc[:,1:9].apply(pd.to_numeric,errors='coerce')
+                    total=bins.sum().sum()
+                    if '유의파고 0.8m 이상' in str(cell('파랑일수',1,1)) and total>0:
+                        wave['annual_days']=float(bins.iloc[:,3:].sum().sum()/total*365)
+                if not waveframe.empty:
+                    waveframe.iloc[:,-2]=bins.sum(axis=1).values
+                    waveframe.iloc[:,-1]=waveframe.iloc[:,-2]/total
+                    sumrow=['Sum']+bins.sum().tolist()+[total,1.0]
+                    proprow=['Prop(%)']+(bins.sum()/total).tolist()+[1.0,np.nan]
+                    waveframe=pd.concat([waveframe,pd.DataFrame([sumrow,proprow],columns=waveframe.columns)],ignore_index=True)
+                wave['criterion']=str(cell('파랑일수',1,1)).split('(',1)[-1].rstrip(')')
+        return {'station':label,'code':stn,'start':start,'end':end,'tables':tables,
+                'pm':pd.DataFrame(pm),'pm_name':pmname,'pm_note':pm_note,
+                'wind':pd.DataFrame(wind),'wave':wave,'wave_frame':waveframe}
+    finally:wb.close()
+
+
+def _lx_long(table, value):
+    if table is None or table.empty:return pd.DataFrame(columns=['연도','월',value])
+    cols=[f'{m}월' for m in range(1,13)]
+    d=table.reindex(columns=['연도']+cols).melt(id_vars='연도',var_name='월',value_name=value)
+    d['월']=d['월'].str.replace('월','').astype(int)
+    return d
+
+
+_LX_COUNTS={'폭풍':'폭풍일수(13.9m_s이상)','강설일수':'강설일수','강수일수(10mm이상)':'강수일수(10mm이상)',
+    '기온일수(-10도이하)':'기온일수(-10도이하)','고온_개정':'고온일수(33도이상)','저온_개정':'저온일수(-12도이하)',
+    '강우_개정':'강수일수(10mm이상)','풍속_개정':'풍속일수(10m_s이상)',
+    '강설5cm_개정':'신적설일수(5cm이상)','강설1cm_개정':'신적설일수(1cm이상)'}
+
+
+def _lx_monthly_counts(tables):
+    result=pd.DataFrame(columns=['연도','월'])
+    for col,name in _LX_COUNTS.items():
+        result=result.merge(_lx_long(tables.get(name),col),on=['연도','월'],how='outer')
+    return result.sort_values(['연도','월']).reset_index(drop=True)
+
+
+def _lx_seed(report):
+    label=report['station'];identity=[report['code']]
+    counts=_lx_monthly_counts(report['tables'])
+    _rx_save('보고서 연월표',identity,counts,report,range(report['start'],report['end']+1))
+    climate=pd.DataFrame(columns=['연도','월'])
+    status={'errors':[]}
+    for kind,col,code in [('안개일수','안개일수_월간','fog'),('뇌전일수','뇌전일수_월간','thunder'),('결빙일수','결빙일수_월간','freezing')]:
+        climate=climate.merge(_lx_long(report['tables'].get(kind),col),on=['연도','월'],how='outer')
+        status[code]={'station_name':label,'source_name':'업로드 기준서식 Excel'}
+    _rx_save('기후통계',[label],climate,status,climate['연도'].unique())
+    if not report['pm'].empty and report['pm_name']:
+        pm=report['pm'];valid=pm.loc[_lx_pm_valid(pm),'연도'].unique()
+        status={'station_name':report['pm_name'],'station_key':'excel:'+report['pm_name'],
+            'station_code':'','station_addr':'','station_network':'','daily':pd.DataFrame(),'year_status':pd.DataFrame(),
+            'source':'기준서식 Excel 월별 충족일수','message':'기존 Excel 월별 자료'}
+        for partial in [True,False]:
+            # Existing Excel has already selected its valid months. This is not a new validity judgment.
+            identity=[label,status['station_key'],partial,'PM10_300_PM25_150_2h_union_x0.5_v1']
+            _rx_save('미세먼지',identity,pm,status,valid)
+    if not report['wind'].empty:
+        _rx_save('관측백분율 연월표',[report['code']],report['wind'],{},report['wind']['연도'].unique())
+    # Match the file's weather station. Period sliders remain user editable.
+    st.session_state['station_select_v37']=label
+    for prefix in ['old','revised','windrose']:
+        st.session_state[f'{prefix}_year_start_v50']=report['start']
+        st.session_state[f'{prefix}_year_end_v50']=report['end']
+    if not report['pm'].empty:
+        st.session_state['pm10_final_year_range']=(int(report['pm']['연도'].min()),int(report['pm']['연도'].max()))
+    if report['wave']:
+        st.session_state['wave_source_mode']='장기파랑 PDF'
+        st.session_state['wave_criterion']=report['wave']['criterion']
+
+
+_lx_raw_daily=fetch_daily_api
+_lx_pivot=make_pivot
+_lx_windmax=make_wind_max_pivot
+_lx_winddir=make_wind_dir_pivot
+
+
+def fetch_daily_api(stn_id,start_yr,end_yr,key):
+    entry=_rx_entry('보고서 연월표',[int(stn_id)])
+    if not entry:return _lx_raw_daily(stn_id,start_yr,end_yr,key)
+    report=entry['status']; tables={k:v.copy() for k,v in report['tables'].items()}
+    # Confirm all required count tables, not merely the year printed on the cover.
+    need=set(range(start_yr,end_yr+1));available=set(need)
+    for name in set(_LX_COUNTS.values()):
+        available &= set(tables.get(name,pd.DataFrame(columns=['연도']))['연도'].astype(int))
+    missing=sorted(need-available)
+    st.caption(f'기준서식 연월표 재사용: {_year_list_text(sorted(available))} / 추가 연도: {_year_list_text(missing) if missing else "없음"}')
+    for a,b in _rx_groups(missing):
+        raw=_lx_raw_daily(stn_id,a,b,key)
+        if raw.empty:continue
+        fresh=_lx_tables_from_daily(raw)
+        for name,frame in fresh.items():
+            if frame.empty or '연도' not in frame:continue
+            old=tables.get(name,pd.DataFrame())
+            # Preserve supplied Excel rows. New source fills only years absent from that particular table.
+            if not old.empty:frame=frame[~frame['연도'].isin(old['연도'])]
+            tables[name]=_rx_concat([old,frame]).sort_values('연도').reset_index(drop=True)
+    report=dict(report,tables=tables)
+    counts=_lx_monthly_counts(tables)
+    _rx_save('보고서 연월표',[int(stn_id)],counts,report,counts['연도'].unique())
+    result=counts[counts['연도'].between(start_yr,end_yr)].copy()
+    result.attrs['report_monthly']=True
+    st.session_state['_lx_current_tables']={name:_filter_year_period(frame,start_yr,end_yr) for name,frame in tables.items()}
+    result.attrs['asos_fetch_status']={'ok_years':sorted(result['연도'].astype(int).unique()),'error_years':[], 'no_data_years':[], 'error_messages':{}}
+    return result
+
+
+def make_pivot(df,value_col,monthly_agg='mean',annual_agg='mean'):
+    if not df.attrs.get('report_monthly'):return _lx_pivot(df,value_col,monthly_agg,annual_agg)
+    name=_LX_PIVOT_NAMES.get((value_col,monthly_agg,annual_agg),value_col)
+    table=st.session_state.get('_lx_current_tables',{}).get(name,pd.DataFrame()).copy()
+    if table.empty:return table
+    columns=[f'{m}월' for m in range(1,13)]
+    values=table[columns].apply(pd.to_numeric,errors='coerce')
+    output={'mean':'연평균','sum':'연합계','max':'연최대','min':'연최소'}[annual_agg]
+    table[output]=values.sum(axis=1,min_count=1) if annual_agg=='sum' else getattr(values,annual_agg)(axis=1)
+    return table
+
+
+def make_wind_max_pivot(df,val_col,dir_col):
+    if not df.attrs.get('report_monthly'):return _lx_windmax(df,val_col,dir_col)
+    name='최대풍속_및_풍향' if val_col=='최대풍속' else '순간최대풍속_및_풍향'
+    table=st.session_state.get('_lx_current_tables',{}).get(name,pd.DataFrame()).copy()
+    if not table.empty:
+        def maximum(row):
+            vals=[x for x in row if isinstance(x,str) and re.match(r'^\d',x)]
+            return max(vals,key=lambda v:float(v.split(' ')[0])) if vals else np.nan
+        table['연최대']=table[[f'{m}월' for m in range(1,13)]].apply(maximum,axis=1)
+    return table
+
+
+def make_wind_dir_pivot(df,val_col,dir_col):
+    if not df.attrs.get('report_monthly'):return _lx_winddir(df,val_col,dir_col)
+    return st.session_state.get('_lx_current_tables',{}).get('풍향별_최대풍속' if val_col=='최대풍속' else '풍향별_최대순간풍속',pd.DataFrame()).copy()
+
+
+_lx_basis_original=_report_windrose_monthly_basis
+
+def _report_windrose_monthly_basis(hourly,station_name,start_year,end_year):
+    if hourly is None or not hourly.attrs.get('report_wind_monthly'):
+        return _lx_basis_original(hourly,station_name,start_year,end_year)
+    d=hourly[hourly['연도'].between(start_year,end_year)]
+    columns=['CALM',*WIND16_ORDER,'소계'];out={}
+    def summary(sub):
+        records=[];n=sub.loc[sub['계급번호'].eq(0),'관측수'].sum()
+        if n<=0:return None
+        for i in range(4):
+            t=sub[sub['계급번호'].eq(i)]
+            records.append({c:round(float((t[c]*t['관측수']).sum()/n),2) for c in columns})
+        return records,int(n)
+    for (y,m),sub in d.groupby(['연도','월']):out[(int(y),int(m))]=summary(sub)
+    for y,sub in d.groupby('연도'):out[(int(y),0)]=summary(sub)
+    for m,sub in d.groupby('월'):out[(0,int(m))]=summary(sub)
+    out[(0,0)]=summary(d)
+    return out
+
+
+_lx_resolve_wind=resolve_shared_windrose
+
+def resolve_shared_windrose(station_code,station_name,start_year,end_year,source,api_key,force=False):
+    entry=_rx_entry('관측백분율 연월표',[int(station_code)])
+    if not entry or force:return _lx_resolve_wind(station_code,station_name,start_year,end_year,source,api_key,force)
+    frame=entry['frame'];missing=sorted(set(range(start_year,end_year+1))-set(entry['years']))
+    for a,b in _rx_groups(missing):
+        hourly,table,status=_lx_resolve_wind(station_code,station_name,a,b,source,api_key)
+        basis=_lx_basis_original(hourly,station_name,a,b);rows=[]
+        for (y,m),found in basis.items():
+            if y and m and found:
+                for i,record in enumerate(found[0]):rows.append(dict(record,연도=y,월=m,계급번호=i,관측수=found[1]))
+        frame=_rx_concat([frame,pd.DataFrame(rows)])
+    _rx_save('관측백분율 연월표',[int(station_code)],frame,{},frame['연도'].unique())
+    frame=frame[frame['연도'].between(start_year,end_year)].copy();frame.attrs['report_wind_monthly']=True
+    records=[];cols=['CALM',*WIND16_ORDER,'소계']
+    for name,months in [('봄',[3,4,5]),('여름',[6,7,8]),('가을',[9,10,11]),('겨울',[12,1,2]),('전년',list(range(1,13)))]:
+        part=frame[frame['월'].isin(months)].copy();part.attrs['report_wind_monthly']=True
+        found=_report_windrose_monthly_basis(part,station_name,start_year,end_year).get((0,0))
+        if found:
+            for i,row in enumerate(found[0]):records.append(dict(row,구분=name,월='',**{'풍향/풍속':WINDROSE_SPEED_BINS[i][0]}))
+            records.append(dict({c:round(sum(r[c] for r in found[0]),2) for c in cols},구분=name,월='',**{'풍향/풍속':'계'}))
+    return frame,pd.DataFrame(records),{'ok':bool(records),'periods':{},'source_name':'Excel 연월별 관측백분율·관측수 가중집계',
+        'message':'저장된 백분율의 반올림 정밀도를 유지하여 재집계합니다.'}
+
+
+_lx_choose_station=_airkorea_choose_station
+
+def _airkorea_choose_station(catalog,selected_label,preferred_code='',preferred_name='',preferred_key='',manual_selection=False):
+    if str(preferred_key).startswith('excel:'):
+        matches=catalog[catalog['측정소명'].astype(str).str.strip().eq(preferred_name.strip())]
+        if len(matches)!=1:return None  # Never silently change the station used by the uploaded report.
+        return matches.iloc[0].to_dict()
+    return _lx_choose_station(catalog,selected_label,preferred_code=preferred_code,preferred_name=preferred_name,
+                              preferred_key=preferred_key,manual_selection=manual_selection)
 
 _rx_upload_ui()
 
@@ -27420,6 +27822,9 @@ if workday_mode == "개정":
                 "장기파랑 PDF 전체에서 **파고×주기 출현횟수표**를 찾아 검산합니다. "
                 "선택한 표의 출현율로 연간 비작업일수를 환산하고 12개월에 균등배분합니다. 표를 인식하지 못하면 본문 요약값을 사용합니다."
             )
+            _lx_source = _rx_entry('보고서 연월표', [int(station_code)])
+            if _lx_source and _lx_source['status'].get('wave'):
+                st.caption('기존 Excel의 장기파랑 PDF 결과를 사용할 수 있습니다. 다른 기준이나 자료를 적용하려면 새 PDF를 선택하세요.')
             wave_pdf = st.file_uploader(
                 "장기파랑 검토서 PDF",
                 type=["pdf"],
@@ -27945,7 +28350,7 @@ if st.button("🚀 데이터 수집 및 엑셀 생성", type="primary"):
         st.stop()
 
     run_status_log.append(
-        f"✅ ASOS 일자료 수집 완료: {len(asos_ok_years)}개년"
+        f"✅ 기상 연월자료 적용: {len(asos_ok_years)}개년" if df_daily.attrs.get("report_monthly") else f"✅ ASOS 일자료 수집 완료: {len(asos_ok_years)}개년"
     )
     if asos_no_data_years:
         run_status_log.append(
@@ -27961,51 +28366,52 @@ if st.button("🚀 데이터 수집 및 엑셀 생성", type="primary"):
     # -------------------------------------------------------------------------
     # C. 일자료 전처리
     # -------------------------------------------------------------------------
-    for c in ["최저해면기압", "최소상대습도"]:
-        if c in df_daily.columns:
-            df_daily[c] = df_daily[c].replace(0.0, np.nan)
+    if not df_daily.attrs.get('report_monthly'):
+        for c in ["최저해면기압", "최소상대습도"]:
+            if c in df_daily.columns:
+                df_daily[c] = df_daily[c].replace(0.0, np.nan)
 
-    df_daily["날짜"] = pd.to_datetime(
-        df_daily[["연도", "월", "일"]].rename(
-            columns={"연도": "year", "월": "month", "일": "day"}
-        ),
-        errors="coerce",
-    ).dt.strftime("%Y-%m-%d")
+        df_daily["날짜"] = pd.to_datetime(
+            df_daily[["연도", "월", "일"]].rename(
+                columns={"연도": "year", "월": "month", "일": "day"}
+            ),
+            errors="coerce",
+        ).dt.strftime("%Y-%m-%d")
 
-    df_daily["맑음일수"] = (df_daily["평균전운량"] < 2.5).astype(int)
-    df_daily["흐림일수"] = (df_daily["평균전운량"] >= 7.5).astype(int)
-    df_daily["안개일수"] = (
-        df_daily["일기현상"].fillna("").astype(str).str.contains("안개", regex=False).astype(int)
-    )
-    df_daily["강수일수(10mm이상)"] = (df_daily["일강수량"] >= 10.0).astype(int)
-    df_daily["강설일수"] = (
-        df_daily["일기현상"].fillna("").astype(str).str.contains("눈", regex=False)
-        | (df_daily["적설"] > 0)
-    ).astype(int)
-    # 기존 기준의 폭풍일수: ASOS 일자료의 일 최대풍속(maxWs)이 13.9m/s 이상인 날.
-    # 최대풍속 자체가 미관측인 날은 0일이 아니라 결측값으로 유지한다.
-    _daily_max_wind = pd.to_numeric(df_daily["최대풍속"], errors="coerce")
-    df_daily["폭풍일수(13.9m/s이상)"] = np.where(
-        _daily_max_wind.notna(),
-        (_daily_max_wind >= 13.9).astype(float),
-        np.nan,
-    )
-    df_daily["기온일수(-10도이하)"] = (df_daily["최저기온"] <= -10.0).astype(int)
-    df_daily["폭풍"] = df_daily["폭풍일수(13.9m/s이상)"]
+        df_daily["맑음일수"] = (df_daily["평균전운량"] < 2.5).astype(int)
+        df_daily["흐림일수"] = (df_daily["평균전운량"] >= 7.5).astype(int)
+        df_daily["안개일수"] = (
+            df_daily["일기현상"].fillna("").astype(str).str.contains("안개", regex=False).astype(int)
+        )
+        df_daily["강수일수(10mm이상)"] = (df_daily["일강수량"] >= 10.0).astype(int)
+        df_daily["강설일수"] = (
+            df_daily["일기현상"].fillna("").astype(str).str.contains("눈", regex=False)
+            | (df_daily["적설"] > 0)
+        ).astype(int)
+        # 기존 기준의 폭풍일수: ASOS 일자료의 일 최대풍속(maxWs)이 13.9m/s 이상인 날.
+        # 최대풍속 자체가 미관측인 날은 0일이 아니라 결측값으로 유지한다.
+        _daily_max_wind = pd.to_numeric(df_daily["최대풍속"], errors="coerce")
+        df_daily["폭풍일수(13.9m/s이상)"] = np.where(
+            _daily_max_wind.notna(),
+            (_daily_max_wind >= 13.9).astype(float),
+            np.nan,
+        )
+        df_daily["기온일수(-10도이하)"] = (df_daily["최저기온"] <= -10.0).astype(int)
+        df_daily["폭풍"] = df_daily["폭풍일수(13.9m/s이상)"]
 
-    # 개정 작업일수 기준 (업로드된 기준표)
-    df_daily["고온_개정"] = (df_daily["최고기온"] >= 33.0).astype(int)
-    df_daily["저온_개정"] = (df_daily["최저기온"] <= -12.0).astype(int)
-    df_daily["강우_개정"] = (df_daily["일강수량"] >= 10.0).astype(int)
-    df_daily["풍속_개정"] = (df_daily["최대풍속"] >= 10.0).astype(int)
-    df_daily["강설5cm_개정"] = (df_daily["일최심신적설"] >= 5.0).astype(int)
-    df_daily["강설1cm_개정"] = (df_daily["일최심신적설"] >= 1.0).astype(int)
+        # 개정 작업일수 기준 (업로드된 기준표)
+        df_daily["고온_개정"] = (df_daily["최고기온"] >= 33.0).astype(int)
+        df_daily["저온_개정"] = (df_daily["최저기온"] <= -12.0).astype(int)
+        df_daily["강우_개정"] = (df_daily["일강수량"] >= 10.0).astype(int)
+        df_daily["풍속_개정"] = (df_daily["최대풍속"] >= 10.0).astype(int)
+        df_daily["강설5cm_개정"] = (df_daily["일최심신적설"] >= 5.0).astype(int)
+        df_daily["강설1cm_개정"] = (df_daily["일최심신적설"] >= 1.0).astype(int)
 
     # -------------------------------------------------------------------------
     # D. 로컬 시간자료/일자료 보강
     # -------------------------------------------------------------------------
     csv_wind_pivot = pd.DataFrame()
-    df_hourly, _ = load_hourly_local()
+    df_hourly, _ = (None, '') if df_daily.attrs.get('report_monthly') else load_hourly_local()
     if df_hourly is not None:
         stn_col = next((c for c in df_hourly.columns if "지점명" in c), None)
         date_col = next((c for c in df_hourly.columns if "일시" in c or "시간" in c), None)
@@ -28046,7 +28452,14 @@ if st.button("🚀 데이터 수집 및 엑셀 생성", type="primary"):
         run_status_log.append("🌫️ 개정 안개: 기상자료개방포털 공식 안개일수 × 30% 적용")
 
         if wave_source_mode == "장기파랑 PDF":
-            if not wave_pdf_bytes:
+            _lx_source = _rx_entry('보고서 연월표', [int(station_code)])
+            _lx_wave = _lx_source['status'].get('wave', {}) if _lx_source else {}
+            if _lx_wave and not wave_pdf_bytes and _lx_wave.get('criterion') == wave_criterion:
+                wave_manual_status = dict(_lx_wave)
+                wave_manual_month_avg = pd.Series(float(_lx_wave['annual_days'])/12, index=range(1,13))
+                wave_occurrence_display = _lx_source['status']['wave_frame'].copy()
+                st.caption('파랑: 업로드 Excel의 장기파랑 PDF 집계값 적용 (기상 분석기간과 별도)')
+            elif not wave_pdf_bytes:
                 wave_manual_status = {
                     "ok": False,
                     "message": "장기파랑 PDF가 업로드되지 않았습니다.",
