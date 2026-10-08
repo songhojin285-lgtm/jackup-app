@@ -26953,8 +26953,6 @@ def _rx_plan(kind, identity, start, end, force=False):
     years = list(range(int(start), int(end)+1))
     cached = sorted(set(years) & set(entry['years'])) if entry else []
     missing = [y for y in years if y not in cached]
-    if cached: st.caption(f'{kind}: Excel/세션 재사용 {len(cached)}개년 ({_year_list_text(cached)})')
-    if missing: st.caption(f'{kind}: 추가 확인 {len(missing)}개년 ({_year_list_text(missing)})')
     return entry, cached, missing
 
 
@@ -27086,13 +27084,41 @@ def collect_airkorea_final_pm10(selected_label, start_year, end_year, preferred_
     status = dict(entry['status']) if entry else {}
     daily = [_rx_slice(status.get('daily', pd.DataFrame()), cached)]
     yearrows = [_rx_slice(status.get('year_status', pd.DataFrame()), cached)]
-    for a, b in _rx_groups(missing):
-        data, info = _rx_original_pm(selected_label, a, b, preferred_code=preferred_code, preferred_name=preferred_name,
-            preferred_key=preferred_key, manual_selection=manual_selection,
-            auto_download=auto_download or bool(entry), headless=headless,
-            force_retry_missing=force_retry_missing, allow_partial=allow_partial)
-        frames.append(data); daily.append(info.get('daily', pd.DataFrame())); yearrows.append(info.get('year_status', pd.DataFrame()))
-        status.update(info)
+    failures = []
+    if missing:
+        # Restore bundled compact data before trying remote ZIP downloads.
+        try:
+            _pm_auto_seed()
+        except Exception:
+            pass  # A missing/invalid bundle must not block the normal source.
+    progress = st.progress(0.0, text='미세먼지 추가 연도 확인 중') if missing else None
+    try:
+        for index, year in enumerate(sorted(missing)):
+            progress.progress(index / len(missing), text=f'미세먼지 {year}년 확인 중 ({index+1}/{len(missing)})')
+            try:
+                data, info = _rx_original_pm(selected_label, year, year, preferred_code=preferred_code,
+                    preferred_name=preferred_name, preferred_key=preferred_key,
+                    manual_selection=manual_selection, auto_download=auto_download or bool(entry),
+                    headless=headless, force_retry_missing=force_retry_missing, allow_partial=allow_partial)
+                frames.append(data)
+                daily.append(info.get('daily', pd.DataFrame()))
+                yearrows.append(info.get('year_status', pd.DataFrame()))
+                if info.get('ok'):
+                    status.update(info)
+                else:
+                    failures.append({'연도': year, '상태': '미확인',
+                                     '메시지': info.get('message', '추가 자료를 확인하지 못했습니다.')})
+            except Exception as exc:
+                failures.append({'연도': year, '상태': '미확인',
+                                 '메시지': f'추가 자료 수집 실패: {type(exc).__name__}'})
+            progress.progress((index+1) / len(missing), text=f'미세먼지 {year}년 확인 완료')
+    finally:
+        if progress is not None:
+            progress.empty()
+    if failures:
+        yearrows.append(pd.DataFrame(failures))
+        st.warning('미세먼지 추가 자료 미확인 연도: ' + ', '.join(str(r['연도']) for r in failures)
+                   + '. 확보된 Excel 자료는 유지하며, 미확인 자료를 0일로 처리하지 않습니다.')
     result = _rx_concat(frames)
     usable = sorted(result.loc[_lx_pm_valid(result), '연도'].astype(int).unique()) if not result.empty else []
     # Keep confirmed partial-month flags, but do not cache a completely unavailable year as zero.
@@ -27410,7 +27436,6 @@ def fetch_daily_api(stn_id,start_yr,end_yr,key):
     for name in set(_LX_COUNTS.values()):
         available &= set(tables.get(name,pd.DataFrame(columns=['연도']))['연도'].astype(int))
     missing=sorted(need-available)
-    st.caption(f'기준서식 연월표 재사용: {_year_list_text(sorted(available))} / 추가 연도: {_year_list_text(missing) if missing else "없음"}')
     for a,b in _rx_groups(missing):
         raw=_lx_raw_daily(stn_id,a,b,key)
         if raw.empty:continue
@@ -28223,7 +28248,527 @@ if workday_mode == "기존":
 elif workday_mode == "개정":
     st.markdown("### 🆕 개정 작업일수 산정")
 
-if st.button("🚀 데이터 수집 및 엑셀 생성", type="primary"):
+def _render_saved_workday_result(*, _render_cache, api_key_daily, criteria_old_df, criteria_rev_df, csv_wind_pivot, df_daily, df_monthly, final_old_df, final_rev_df, holidays_df, land_old_df, land_rev_df, obs_avg_old_disp, pm10_monthly, pm10_station_name, pm10_status, pm10_year_range, rev_obs_disp, sea_old_df, sea_rev_df, station_code, station_name, summary_old_df, summary_rev_df, tables, wave_criterion, wave_manual_status, wave_month_avg, wave_occurrence_display, wave_occurrence_status, wave_source_mode, windrose_data_source, windrose_occurrence_table, wink_collect_result, wink_source_name, wink_station_name, wink_year_range, workday_mode, workday_period_results, year_range):
+    tabs = st.tabs(
+        [
+            "🌡️ 기온", "🌪️ 기압", "💧 습도", "🌧️ 강수량",
+            "🌬️ 풍속/풍향", "⛅ 현상일수", "🌊 파랑/미세먼지 일수", "🚧 작업일수 산정", "📥 엑셀 다운로드",
+        ],
+        height="content",
+    )
+
+    with tabs[0]:
+        for t in ["평균기온", "평균최고기온", "평균최저기온", "최고기온", "최저기온"]:
+            st.markdown(f"##### 🔸 {t}")
+            st.dataframe(tables[t], use_container_width=True, hide_index=True)
+
+    with tabs[1]:
+        for t in ["평균해면기압", "최고해면기압", "최저해면기압"]:
+            st.markdown(f"##### 🔸 {t}")
+            st.dataframe(tables[t], use_container_width=True, hide_index=True)
+
+    with tabs[2]:
+        for t in ["평균상대습도", "최소상대습도"]:
+            st.markdown(f"##### 🔸 {t}")
+            st.dataframe(tables[t], use_container_width=True, hide_index=True)
+
+    with tabs[3]:
+        for t in ["강수량(24시간평균)", "1일최다강수량", "1시간최다강수량"]:
+            st.markdown(f"##### 🔸 {t}")
+            st.dataframe(tables[t], use_container_width=True, hide_index=True)
+
+    with tabs[4]:
+        if not csv_wind_pivot.empty:
+            st.success("✅ hourly_wind.csv 자료를 방위별 최대풍속에 적용했습니다.")
+        for t in ["평균풍속", "최대풍속_및_풍향", "순간최대풍속_및_풍향", "풍향별_최대풍속", "풍향별_최대순간풍속"]:
+            st.markdown(f"##### 🔸 {t.replace('_s', '/s')}")
+            st.dataframe(tables[t], use_container_width=True, hide_index=True)
+
+    with tabs[5]:
+        st.info("🌫️ 안개 · ⚡ 뇌전 · 🧊 결빙은 기상자료개방포털 공식 CSV를 사용합니다.")
+
+        phenomenon_names = [
+            "맑음일수", "흐림일수", "안개일수", "강수일수(10mm이상)", "강설일수",
+            "결빙일수", "뇌전일수", "폭풍일수(13.9m_s이상)", "기온일수(-10도이하)",
+        ]
+        if workday_mode == "개정":
+            phenomenon_names += [
+                "고온일수(33도이상)", "저온일수(-12도이하)", "풍속일수(10m_s이상)",
+                "신적설일수(5cm이상)", "신적설일수(1cm이상)",
+            ]
+        for t in phenomenon_names:
+            st.markdown(f"##### 🔸 {t.replace('_s', '/s')}")
+            st.dataframe(tables[t], use_container_width=True, hide_index=True)
+
+        st.caption("0 = 실제 통계값 0 / 빈칸 = 자료 없음·미관측·아직 미발간")
+
+    with tabs[6]:
+        st.subheader("🌊 파랑 / 🌫️ 미세먼지 일수")
+        if workday_mode != "개정":
+            st.info("이 탭은 🆕 개정 작업일수 산정에서 사용하는 파랑·미세먼지 자료를 보여줍니다. 왼쪽의 산정 화면에서 '🆕 개정 작업일수 산정'을 선택하세요.")
+        else:
+            st.markdown("### 🌊 파랑일수")
+            st.info("WINK 자료는 본 앱에서 별도의 보정을 적용하지 않고 사용합니다. 파랑일수 산정에는 대상 해역의 특성과 보정·검토 결과가 반영된 장기파랑 검토서(PDF) 자료 사용을 권장합니다.")
+            st.caption(f"적용 자료원: **{wave_manual_status.get('source_mode', wave_source_mode)}**")
+
+            if wave_source_mode == "WINK 관측파랑 자동조회":
+                if not wave_occurrence_display.empty and wave_occurrence_status.get("ok"):
+                    st.caption(
+                        "WINK 시간별 원시 유의파고·주기를 앱에서 직접 재분류한 파고×주기 계급별 출현회수 표입니다. "
+                        "사석공 Hs≥0.8m는 실제 관측값에서 직접 판정합니다."
+                    )
+                    st.dataframe(wave_occurrence_display, use_container_width=True, hide_index=True)
+                    rate = wave_manual_status.get("occurrence_rate_pct")
+                    annual_days = wave_manual_status.get("annual_days")
+                    monthly_days = wave_manual_status.get("monthly_days")
+                    if pd.notna(rate) and pd.notna(annual_days):
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("적용 파랑 출현율", f"{float(rate):.1f}%")
+                        c2.metric("연간 파랑 비작업일수", f"{float(annual_days):.2f}일")
+                        c3.metric("월 균등배분", f"{float(monthly_days if pd.notna(monthly_days) else annual_days/12):.2f}일/월")
+                        if "DCM" not in str(wave_criterion):
+                            st.caption(
+                                f"정확계산: WINK 원시자료에서 Hs≥0.8m 실제 회수를 집계 → "
+                                f"출현율 {float(rate):.4f}% × 365 = {float(annual_days):.2f}일/년 → ÷12 = {float(annual_days)/12:.2f}일/월"
+                            )
+                        else:
+                            st.caption(
+                                f"정확계산: WINK 원시자료에서 DCM 기준 충족 회수를 직접 판정 → "
+                                f"출현율 {float(rate):.4f}% × 365 = {float(annual_days):.2f}일/년 → ÷12 = {float(annual_days)/12:.2f}일/월"
+                            )
+                    if isinstance(wave_manual_status.get("year_status"), pd.DataFrame) and not wave_manual_status["year_status"].empty:
+                        with st.expander("WINK 연도별 원시자료 조회상태", expanded=False):
+                            st.dataframe(wave_manual_status["year_status"], use_container_width=True, hide_index=True)
+                else:
+                    st.warning("WINK 원시 파랑자료가 없습니다. 자동조회 상태를 확인하세요.")
+                    if wave_manual_status.get("message"):
+                        st.caption(wave_manual_status.get("message"))
+            else:
+                if wave_manual_status.get("ok"):
+                    pdf_result = wave_manual_status.get("pdf_result") or {}
+                    _frequency = pdf_result.get("frequency_table")
+                    if _frequency:
+                        st.markdown("#### 파고 × 주기별 출현빈도 (회)")
+                        _display = _wave_table_display(_frequency)
+                        _mask = pdf_result["mask"]
+                        def _highlight_wave_cells(frame):
+                            styles = pd.DataFrame("", index=frame.index, columns=frame.columns)
+                            for i in range(_mask.shape[0]):
+                                for j in range(_mask.shape[1]):
+                                    if _mask[i,j]:
+                                        styles.iloc[i,j] = "background-color: #fff0b3; color: #202020"
+                            return styles
+                        st.dataframe(_display.style.apply(_highlight_wave_cells, axis=None).format(precision=2, na_rep=""), use_container_width=True)
+                        st.caption(f"노란색: 적용 기준 해당 계급 · {pdf_result['count']:,.0f}회 / 전체 {_frequency['total']:,.0f}회 · {wave_criterion}")
+                        st.markdown("#### 선택한 표 기준 파랑 작업일수 산정")
+                        st.metric("파랑만 고려한 연간 작업가능일수", f"{365-pdf_result['annual_days']:.2f}일/년")
+                        st.caption("선택한 표의 전체 횟수를 분모로 출현율 × 365일을 환산한 추정값입니다. 특정 파향 표의 비율은 해당 파향 범위 내 비율입니다. 월별 값은 실제 월별 집계가 아닌 균등배분입니다.")
+                        if pdf_result.get("reported_results"):
+                            with st.expander("PDF 본문 요약값과 비교"):
+                                st.dataframe(pd.DataFrame(pdf_result["reported_results"]), hide_index=True)
+                                st.caption("본문의 반올림값·적용 범위가 다를 수 있습니다. 현재 계산은 선택한 표의 출현횟수를 사용합니다.")
+                    else:
+                        st.info("분류표를 검증하지 못해 PDF 본문 요약 일수만 적용했습니다.")
+                    annual_days = wave_manual_status.get("annual_days")
+                    monthly_days = wave_manual_status.get("monthly_days")
+                    rate = wave_manual_status.get("occurrence_rate_pct")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("PDF 산정 출현율", f"{float(rate):.2f}%" if pd.notna(rate) else "-")
+                    c2.metric("연간 파랑 비작업일수", f"{float(annual_days):.2f}일" if pd.notna(annual_days) else "-")
+                    c3.metric("월 균등배분", f"{float(monthly_days):.2f}일/월" if pd.notna(monthly_days) else "-")
+                    st.caption(
+                        f"PDF 자동판독: {pdf_result.get('kind','-')} / PDF {pdf_result.get('page','-')}페이지 / "
+                        f"파일: {wave_manual_status.get('source_file','-')}"
+                    )
+                    if pdf_result.get("snippet"):
+                        with st.expander("PDF 적용 근거 원문", expanded=False):
+                            st.write(pdf_result.get("snippet"))
+                else:
+                    st.warning("장기파랑 PDF에서 적용 가능한 비작업일수 결과를 찾지 못했습니다.")
+                    if wave_manual_status.get("message"):
+                        st.caption(wave_manual_status.get("message"))
+
+            if wave_manual_status.get("ok"):
+                wave_month_table = pd.DataFrame({
+                    "월": [f"{m}월" for m in range(1, 13)],
+                    "파랑 비작업일수": [
+                        float(wave_month_avg.loc[m]) if pd.notna(wave_month_avg.loc[m]) else np.nan
+                        for m in range(1, 13)
+                    ],
+                })
+                wave_month_table.loc[len(wave_month_table)] = ["합계", wave_month_table["파랑 비작업일수"].sum(min_count=1)]
+                wave_month_table["파랑 비작업일수"] = pd.to_numeric(wave_month_table["파랑 비작업일수"], errors="coerce").round(2)
+                st.markdown("#### 월별 파랑 비작업일수")
+                st.dataframe(wave_month_table, use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+            st.markdown("### 🌫️ 미세먼지·초미세먼지 경보 농도 기준 충족일수")
+            st.caption("PM10 ≥300 또는 PM2.5 ≥150㎍/㎥가 각각 2시간 연속인 날짜를 중복 제외하여 50% 적용합니다. 실제 발령 이력이 아닌 농도 기준 충족일 · 부분자료 적용 시 확인된 최소일수만 반영 · 진행 중인 월 제외")
+            if not pm10_monthly.empty:
+                st.caption(f"적용 측정소: {pm10_station_name} / {pm10_status.get('coverage','')}")
+                st.markdown("#### 확인된 경보 농도 기준 충족일수(중복 제외, 보정 전)")
+                st.dataframe(make_monthly_direct_pivot(pm10_monthly, "경보발령일수"), use_container_width=True, hide_index=True)
+                st.markdown("#### 적용 비작업일수(경보 농도 기준 충족일수 × 50%)")
+                st.dataframe(make_monthly_direct_pivot(pm10_monthly, "미세먼지_경보50퍼센트"), use_container_width=True, hide_index=True)
+                with st.expander("항목별·중복·일별 산정 근거"):
+                    st.dataframe(pm10_monthly, use_container_width=True, hide_index=True)
+                    st.dataframe(pm10_status.get('daily',pd.DataFrame()), use_container_width=True, hide_index=True)
+                    _evidence = pm10_status.get('hourly_evidence',pd.DataFrame())
+                    if not _evidence.empty:
+                        st.caption("기준 충족 시간과 바로 전 시간의 실제 농도(㎍/㎥)")
+                        _hits = _evidence['PM10연속2시간충족'] | _evidence['PM25연속2시간충족']
+                        st.dataframe(_evidence.loc[_hits], use_container_width=True, hide_index=True)
+
+                with st.expander("연도별 ZIP·측정자료 수집상태"):
+                    st.dataframe(pm10_status.get('year_status',pd.DataFrame()), use_container_width=True, hide_index=True)
+            else:
+                st.warning("판정 가능한 자료가 없습니다. ZIP 확보 및 측정소 자료 상태를 확인하세요.")
+
+    with tabs[7]:
+        period_defs = build_trailing_workday_windows(year_range[0], year_range[1])
+        period_tabs = st.tabs(
+            [
+                f"최근 {item['years']}년 ({item['start_year']}~{item['end_year']})"
+                for item in period_defs
+            ],
+            height="content",
+        )
+
+        for period_tab, period_def in zip(period_tabs, period_defs):
+            requested_years = int(period_def["years"])
+            period_result = workday_period_results.get(requested_years, {})
+            with period_tab:
+                period_start = int(period_def["start_year"])
+                period_end = int(period_def["end_year"])
+                available_span = period_end - period_start + 1
+                st.markdown(
+                    f"#### {requested_years}년치 자료를 사용한 작업가능일수"
+                )
+                st.caption(
+                    f"산정기간: **{period_start}~{period_end}** · "
+                    f"선택한 종료연도 {year_range[1]}년을 기준으로 최근 {requested_years}년"
+                )
+                if available_span < requested_years:
+                    st.warning(
+                        f"선택한 전체기간이 {requested_years}년보다 짧아 "
+                        f"{available_span}개년({period_start}~{period_end})만 사용합니다."
+                    )
+
+                if not period_result.get("ok"):
+                    st.warning(period_result.get("message", "해당 기간의 작업가능일수를 계산하지 못했습니다."))
+                    continue
+
+                actual_year_count = int(period_result.get("actual_year_count", 0))
+                if actual_year_count < available_span:
+                    actual_years = period_result.get("actual_years", [])
+                    actual_label = _compress_years(actual_years) if actual_years else "없음"
+                    st.warning(
+                        f"ASOS 실제 사용자료는 {actual_year_count}/{available_span}개년입니다: {actual_label}"
+                    )
+                else:
+                    st.caption(f"ASOS 실제 사용자료: {actual_year_count}개년")
+
+                st.subheader("📋 1.8.1 해상 작업 불가능일수")
+                st.dataframe(
+                    period_result["sea_df"],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                st.subheader("📋 1.8.2 육상 작업 불가능일수")
+                st.dataframe(
+                    period_result["land_df"],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                st.subheader("📋 1.8.3 법정 공휴일 수")
+                st.dataframe(
+                    period_result["holidays_df"],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                st.subheader("📋 1.8.4 기상 장애일수 (월 평균)")
+                st.dataframe(
+                    period_result["obs_avg_disp"],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                st.subheader("📋 1.8.5 비작업일수 종합 및 작업가능일수")
+                st.dataframe(
+                    period_result["final_df"],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                st.markdown("##### 🔸 최종 작업가능일수 및 가동율")
+                st.dataframe(
+                    period_result["summary_df"],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+    with tabs[8]:
+        st.markdown("#### 📘 기준 보고서와 동일한 서식으로 다운로드")
+        st.caption(
+            "보내주신 기준 Excel의 폰트, 글자 크기, 행·열 크기, 배경색, 테두리, "
+            "병합셀, 차트와 인쇄 설정을 유지하고 현재 조회 결과만 입력합니다."
+        )
+
+        if 'formatted_export' not in _render_cache:
+            template_bytes = _report_embedded_template_bytes()
+
+            formatted_report_bytes = None
+            if template_bytes:
+                try:
+                    report_start_year = max(int(year_range[0]), int(year_range[1]) - 29)
+                    report_end_year = int(year_range[1])
+                    report_old = calculate_workday_period_result(
+                        df_daily=df_daily,
+                        df_monthly=df_monthly,
+                        pm10_monthly=pm10_monthly,
+                        wave_month_avg=wave_month_avg,
+                        holidays_df=holidays_df,
+                        mode="기존",
+                        start_year=report_start_year,
+                        end_year=report_end_year,
+                    )
+                    report_revised = calculate_workday_period_result(
+                        df_daily=df_daily,
+                        df_monthly=df_monthly,
+                        pm10_monthly=pm10_monthly,
+                        wave_month_avg=wave_month_avg,
+                        holidays_df=holidays_df,
+                        mode="개정",
+                        start_year=report_start_year,
+                        end_year=report_end_year,
+                    )
+
+                    old_sea_for_report = report_old.get("sea_df", sea_old_df) if report_old.get("ok") else sea_old_df
+                    old_land_for_report = report_old.get("land_df", land_old_df) if report_old.get("ok") else land_old_df
+                    old_obs_for_report = report_old.get("obs_avg_disp", obs_avg_old_disp) if report_old.get("ok") else obs_avg_old_disp
+                    old_final_for_report = report_old.get("final_df", final_old_df) if report_old.get("ok") else final_old_df
+                    old_summary_for_report = report_old.get("summary_df", summary_old_df) if report_old.get("ok") else summary_old_df
+
+                    rev_sea_for_report = report_revised.get("sea_df", sea_rev_df) if report_revised.get("ok") else sea_rev_df
+                    rev_land_for_report = report_revised.get("land_df", land_rev_df) if report_revised.get("ok") else land_rev_df
+                    rev_obs_for_report = report_revised.get("obs_avg_disp", rev_obs_disp) if report_revised.get("ok") else rev_obs_disp
+                    rev_final_for_report = report_revised.get("final_df", final_rev_df) if report_revised.get("ok") else final_rev_df
+                    rev_summary_for_report = report_revised.get("summary_df", summary_rev_df) if report_revised.get("ok") else summary_rev_df
+
+                    if 'report_wind' not in _render_cache:
+                        _render_cache['report_wind'] = resolve_shared_windrose(
+                            station_code, station_name, report_start_year, report_end_year,
+                            windrose_data_source, api_key_daily)
+                    report_windrose_hourly, report_windrose_table, report_windrose_status = _render_cache['report_wind']
+                    formatted_report_bytes = build_formatted_report_xlsx(
+                        template_bytes=template_bytes,
+                        station_name=station_name,
+                        start_year=report_start_year,
+                        end_year=report_end_year,
+                        tables=tables,
+                        holidays_df=holidays_df,
+                        sea_old_df=old_sea_for_report,
+                        land_old_df=old_land_for_report,
+                        obs_avg_old_disp=old_obs_for_report,
+                        final_old_df=old_final_for_report,
+                        summary_old_df=old_summary_for_report,
+                        sea_rev_df=rev_sea_for_report,
+                        land_rev_df=rev_land_for_report,
+                        rev_obs_disp=rev_obs_for_report,
+                        final_rev_df=rev_final_for_report,
+                        summary_rev_df=rev_summary_for_report,
+                        pm10_monthly=pm10_monthly,
+                        pm10_status=pm10_status,
+                        wave_status=wave_manual_status,
+                        wave_display=wave_occurrence_display,
+                        wave_criterion=wave_criterion,
+                        windrose_table=report_windrose_table,
+                        windrose_status=report_windrose_status,
+                        windrose_hourly=report_windrose_hourly,
+                    )
+                except Exception as exc:
+                    st.error(f"기준 서식 Excel 생성 중 오류가 발생했습니다: {exc}")
+
+            _render_cache['formatted_export'] = (_rx_excel_bytes(formatted_report_bytes) if formatted_report_bytes else None)
+        formatted_report_bytes = _render_cache['formatted_export']
+        report_start_year = max(int(year_range[0]), int(year_range[1]) - 29)
+        report_end_year = int(year_range[1])
+
+        if formatted_report_bytes:
+            st.download_button(
+                label=f"📥 {station_name} 기준서식 보고서 다운로드 (.xlsx)",
+                data=formatted_report_bytes,
+                file_name=(
+                    f"{station_name}_{report_start_year}_{report_end_year}_"
+                    "기초자료조사_기준서식.xlsx"
+                ),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                on_click="ignore",
+            )
+
+        st.divider()
+        st.markdown("#### 📊 원자료형 Excel 다운로드")
+        st.caption("화면에 표시된 전체 계산표를 시트별 원자료 형태로 저장합니다.")
+        if 'raw_export' not in _render_cache:
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                for sn, tdf in tables.items():
+                    tdf.to_excel(writer, sheet_name=sn[:31], index=False)
+                df_monthly.to_excel(writer, sheet_name="기후통계_안개뇌전결빙", index=False)
+                holidays_df.to_excel(writer, sheet_name="법정공휴일수", index=False)
+
+                criteria_old_df.to_excel(writer, sheet_name="기존_산정기준", index=False)
+                sea_old_df.to_excel(writer, sheet_name="기존_해상불가능", index=False)
+                land_old_df.to_excel(writer, sheet_name="기존_육상불가능", index=False)
+                obs_avg_old_disp.to_excel(writer, sheet_name="기존_기상장애", index=False)
+                final_old_df.to_excel(writer, sheet_name="기존_비작업종합", index=False)
+                summary_old_df.to_excel(writer, sheet_name="기존_최종가동율", index=False)
+
+                criteria_rev_df.to_excel(writer, sheet_name="개정_산정기준", index=False)
+                sea_rev_df.to_excel(writer, sheet_name="개정_해상불가능", index=False)
+                land_rev_df.to_excel(writer, sheet_name="개정_육상불가능", index=False)
+                rev_obs_disp.to_excel(writer, sheet_name="개정_기상현상", index=False)
+                final_rev_df.to_excel(writer, sheet_name="개정_비작업종합", index=False)
+                summary_rev_df.to_excel(writer, sheet_name="개정_최종가동율", index=False)
+
+                period_export_rows = []
+                for period_years in (10, 20, 30):
+                    period_result = workday_period_results.get(period_years, {})
+                    if not period_result.get("ok"):
+                        continue
+                    sheet_prefix = f"{period_years}년_{workday_mode}"
+                    period_result["sea_df"].to_excel(
+                        writer,
+                        sheet_name=f"{sheet_prefix}_해상불가"[:31],
+                        index=False,
+                    )
+                    period_result["land_df"].to_excel(
+                        writer,
+                        sheet_name=f"{sheet_prefix}_육상불가"[:31],
+                        index=False,
+                    )
+                    period_result["obs_avg_disp"].to_excel(
+                        writer,
+                        sheet_name=f"{sheet_prefix}_기상장애"[:31],
+                        index=False,
+                    )
+                    period_result["final_df"].to_excel(
+                        writer,
+                        sheet_name=f"{sheet_prefix}_비작업종합"[:31],
+                        index=False,
+                    )
+                    period_result["summary_df"].to_excel(
+                        writer,
+                        sheet_name=f"{sheet_prefix}_최종가동율"[:31],
+                        index=False,
+                    )
+                    period_export_rows.append(
+                        {
+                            "구분": f"최근 {period_years}년",
+                            "산정시작연도": period_result.get("start_year"),
+                            "산정종료연도": period_result.get("end_year"),
+                            "ASOS실제사용연도수": period_result.get("actual_year_count"),
+                            "ASOS실제사용연도": _compress_years(period_result.get("actual_years", [])),
+                        }
+                    )
+                if period_export_rows:
+                    pd.DataFrame(period_export_rows).to_excel(
+                        writer,
+                        sheet_name="기간별_작업일수_산정범위",
+                        index=False,
+                    )
+
+                wave_manual_export = pd.DataFrame({
+                    "월": list(range(1, 13)),
+                    "파랑_비작업일수": wave_month_avg.values,
+                })
+                wave_manual_export.to_excel(writer, sheet_name="개정_파랑월평균", index=False)
+                if wave_manual_status.get("ok") and isinstance(wave_manual_status.get("matrix"), pd.DataFrame):
+                    _mx = wave_manual_status["matrix"].copy()
+                    _mx.index.name = "주기계급"
+                    _mx.reset_index().to_excel(writer, sheet_name="개정_WINK출현율표", index=False)
+                if wave_manual_status.get("ok") and isinstance(wave_manual_status.get("used_cells"), pd.DataFrame) and not wave_manual_status["used_cells"].empty:
+                    wave_manual_status["used_cells"].to_excel(writer, sheet_name="개정_WINK기준반영셀", index=False)
+                if wave_manual_status.get("ok") and isinstance(wave_manual_status.get("monthly_detail"), pd.DataFrame):
+                    wave_manual_status["monthly_detail"].to_excel(writer, sheet_name="개정_WINK파랑연월상세", index=False)
+                if workday_mode == "개정" and wave_source_mode == "WINK 관측파랑 자동조회" and wink_collect_result.get("ok"):
+                    _wink_download_info = pd.DataFrame([{
+                        "지점": wink_station_name,
+                        "자료유형": "WINK 관측 원시 유의파고·주기",
+                        "전체자료_시작": wink_collect_result.get("coverage_start"),
+                        "전체자료_종료": wink_collect_result.get("coverage_end"),
+                        "다운로드파일": wink_collect_result.get("filename", ""),
+                        "자료원": wink_collect_result.get("source_mode", ""),
+                    }])
+                    _wink_download_info.to_excel(writer, sheet_name="개정_WINK원시자료정보", index=False)
+                if not wave_occurrence_display.empty:
+                    wave_occurrence_display.to_excel(writer, sheet_name="개정_파랑계급별출현", index=False)
+                _wave_month_export = pd.DataFrame({
+                    "월": [f"{m}월" for m in range(1, 13)],
+                    "파랑비작업일수": [float(wave_month_avg.loc[m]) if pd.notna(wave_month_avg.loc[m]) else np.nan for m in range(1, 13)],
+                })
+                _wave_month_export.loc[len(_wave_month_export)] = ["합계", _wave_month_export["파랑비작업일수"].sum(min_count=1)]
+                _wave_month_export.to_excel(writer, sheet_name="개정_파랑비작업일수", index=False)
+                if workday_mode == "개정" and wave_source_mode == "장기파랑 PDF" and wave_manual_status.get("ok"):
+                    _pdf_r = wave_manual_status.get("pdf_result") or {}
+                    if _pdf_r.get("frequency_table"):
+                        _wave_table_display(_pdf_r["frequency_table"]).to_excel(writer, sheet_name="PDF_파고주기_출현빈도")
+
+                    pd.DataFrame([{
+                        "자료원": wave_manual_status.get("source_mode", "장기파랑 PDF"),
+                        "파일명": wave_manual_status.get("source_file", ""),
+                        "적용공종": _pdf_r.get("kind", ""),
+                        "PDF페이지": _pdf_r.get("page", ""),
+                        "연간비작업일수": wave_manual_status.get("annual_days"),
+                        "출현율_pct": wave_manual_status.get("occurrence_rate_pct"),
+                        "근거문구": _pdf_r.get("snippet", ""),
+                    }]).to_excel(writer, sheet_name="개정_장기파랑PDF정보", index=False)
+                if not pm10_monthly.empty:
+                    pm10_monthly.to_excel(writer, sheet_name="개정_미세먼지월별", index=False)
+                    make_monthly_direct_pivot(pm10_monthly, "미세먼지_경보50퍼센트").to_excel(writer, sheet_name="개정_미세먼지50%일수", index=False)
+                    make_monthly_direct_pivot(pm10_monthly, "경보발령일수").to_excel(writer, sheet_name="개정_농도기준충족일수", index=False)
+                    if isinstance(pm10_status.get("alarm_records"), pd.DataFrame) and not pm10_status["alarm_records"].empty:
+                        pm10_status["alarm_records"].to_excel(writer, sheet_name="개정_경보발령원본", index=False)
+                    if isinstance(pm10_status.get("daily"), pd.DataFrame) and not pm10_status["daily"].empty:
+                        pm10_status["daily"].to_excel(writer, sheet_name="개정_농도기준일별판정", index=False)
+                    if isinstance(pm10_status.get("year_status"), pd.DataFrame) and not pm10_status["year_status"].empty:
+                        pm10_status["year_status"].to_excel(writer, sheet_name="개정_ZIP연도별수집", index=False)
+
+                if not windrose_occurrence_table.empty:
+                    windrose_occurrence_table.to_excel(writer, sheet_name="계급별 관측백분율", index=False)
+
+                pd.DataFrame({
+                    "설정": [
+                        "작업일수 산정 모드", "관측지점", "조회기간",
+                        "파랑 기준", "파랑 자료원 방식", "파랑 적용기간/근거", "WINK 파랑 관측지점", "파랑 자료파일/자료원",
+                        "환산 연간 파랑 비작업일수", "미세먼지 자료원", "미세먼지 분석기간", "경보 지역·권역", "경보 적용계수", "경보 기준", "집계 방식"
+                    ],
+                    "값": [
+                        workday_mode, station_name, f"{year_range[0]}~{year_range[1]}",
+                        wave_criterion, wave_source_mode, (wave_manual_status.get("coverage") or (f"{wink_year_range[0]}~{wink_year_range[1]}" if wave_source_mode == "WINK 관측파랑 자동조회" else "PDF 자동판독")), wink_station_name if wave_source_mode == "WINK 관측파랑 자동조회" else "", wave_manual_status.get("source_file") or wink_source_name,
+                        wave_manual_status.get("annual_days"), "에어코리아 최종확정 ZIP 시간농도 자료", f"{pm10_year_range[0]}–{pm10_year_range[1]}", pm10_station_name, 0.5, "PM10≥300 또는 PM2.5≥150 각각 연속 2시간", "경보 농도 기준 충족일 합집합 × 50%"
+                    ]
+                }).to_excel(writer, sheet_name="산정설정", index=False)
+
+            _render_cache['raw_export'] = _rx_excel_bytes(output.getvalue())
+
+        st.download_button(
+            label=f"📄 {station_name} 원자료형 종합 분석 다운로드 (.xlsx)",
+            data=_render_cache['raw_export'],
+            file_name=f"{station_name}_{workday_mode}_작업일수_종합분석.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            on_click="ignore",
+        )
+
+
+
+
+_run_requested = st.button("🚀 데이터 수집 및 엑셀 생성", type="primary")
+if _run_requested:
     if wave_pdf_parse.get('ok'):
         _rx_save('장기파랑 PDF', [station_name], pd.DataFrame(),
                  {'parse': wave_pdf_parse, 'name': wave_pdf_name}, [])
@@ -28458,7 +29003,6 @@ if st.button("🚀 데이터 수집 및 엑셀 생성", type="primary"):
                 wave_manual_status = dict(_lx_wave)
                 wave_manual_month_avg = pd.Series(float(_lx_wave['annual_days'])/12, index=range(1,13))
                 wave_occurrence_display = _lx_source['status']['wave_frame'].copy()
-                st.caption('파랑: 업로드 Excel의 장기파랑 PDF 집계값 적용 (기상 분석기간과 별도)')
             elif not wave_pdf_bytes:
                 wave_manual_status = {
                     "ok": False,
@@ -28961,510 +29505,17 @@ if st.button("🚀 데이터 수집 및 엑셀 생성", type="primary"):
     # G. 화면 출력
     # v48 final: 작업일수 산정 탭(tabs[7]) 복원 / Excel 다운로드 tabs[8]
     # -------------------------------------------------------------------------
-    tabs = st.tabs(
-        [
-            "🌡️ 기온", "🌪️ 기압", "💧 습도", "🌧️ 강수량",
-            "🌬️ 풍속/풍향", "⛅ 현상일수", "🌊 파랑/미세먼지 일수", "🚧 작업일수 산정", "📥 엑셀 다운로드",
-        ],
-        height="content",
-    )
+    st.session_state['_workday_display_v1'] = {
+        'inputs': {name: globals()[name] for name in ('criteria_old_df', 'criteria_rev_df', 'csv_wind_pivot', 'df_daily', 'df_monthly', 'final_old_df', 'final_rev_df', 'holidays_df', 'land_old_df', 'land_rev_df', 'obs_avg_old_disp', 'pm10_monthly', 'pm10_station_name', 'pm10_status', 'pm10_year_range', 'rev_obs_disp', 'sea_old_df', 'sea_rev_df', 'station_code', 'station_name', 'summary_old_df', 'summary_rev_df', 'tables', 'wave_criterion', 'wave_manual_status', 'wave_month_avg', 'wave_occurrence_display', 'wave_occurrence_status', 'wave_source_mode', 'windrose_data_source', 'windrose_occurrence_table', 'wink_collect_result', 'wink_source_name', 'wink_station_name', 'wink_year_range', 'workday_mode', 'workday_period_results', 'year_range')},
+        'render_cache': {},
+    }
 
-    with tabs[0]:
-        for t in ["평균기온", "평균최고기온", "평균최저기온", "최고기온", "최저기온"]:
-            st.markdown(f"##### 🔸 {t}")
-            st.dataframe(tables[t], use_container_width=True, hide_index=True)
-
-    with tabs[1]:
-        for t in ["평균해면기압", "최고해면기압", "최저해면기압"]:
-            st.markdown(f"##### 🔸 {t}")
-            st.dataframe(tables[t], use_container_width=True, hide_index=True)
-
-    with tabs[2]:
-        for t in ["평균상대습도", "최소상대습도"]:
-            st.markdown(f"##### 🔸 {t}")
-            st.dataframe(tables[t], use_container_width=True, hide_index=True)
-
-    with tabs[3]:
-        for t in ["강수량(24시간평균)", "1일최다강수량", "1시간최다강수량"]:
-            st.markdown(f"##### 🔸 {t}")
-            st.dataframe(tables[t], use_container_width=True, hide_index=True)
-
-    with tabs[4]:
-        if not csv_wind_pivot.empty:
-            st.success("✅ hourly_wind.csv 자료를 방위별 최대풍속에 적용했습니다.")
-        for t in ["평균풍속", "최대풍속_및_풍향", "순간최대풍속_및_풍향", "풍향별_최대풍속", "풍향별_최대순간풍속"]:
-            st.markdown(f"##### 🔸 {t.replace('_s', '/s')}")
-            st.dataframe(tables[t], use_container_width=True, hide_index=True)
-
-    with tabs[5]:
-        st.info("🌫️ 안개 · ⚡ 뇌전 · 🧊 결빙은 기상자료개방포털 공식 CSV를 사용합니다.")
-
-        phenomenon_names = [
-            "맑음일수", "흐림일수", "안개일수", "강수일수(10mm이상)", "강설일수",
-            "결빙일수", "뇌전일수", "폭풍일수(13.9m_s이상)", "기온일수(-10도이하)",
-        ]
-        if workday_mode == "개정":
-            phenomenon_names += [
-                "고온일수(33도이상)", "저온일수(-12도이하)", "풍속일수(10m_s이상)",
-                "신적설일수(5cm이상)", "신적설일수(1cm이상)",
-            ]
-        for t in phenomenon_names:
-            st.markdown(f"##### 🔸 {t.replace('_s', '/s')}")
-            st.dataframe(tables[t], use_container_width=True, hide_index=True)
-
-        st.caption("0 = 실제 통계값 0 / 빈칸 = 자료 없음·미관측·아직 미발간")
-
-    with tabs[6]:
-        st.subheader("🌊 파랑 / 🌫️ 미세먼지 일수")
-        if workday_mode != "개정":
-            st.info("이 탭은 🆕 개정 작업일수 산정에서 사용하는 파랑·미세먼지 자료를 보여줍니다. 왼쪽의 산정 화면에서 '🆕 개정 작업일수 산정'을 선택하세요.")
-        else:
-            st.markdown("### 🌊 파랑일수")
-            st.info("WINK 자료는 본 앱에서 별도의 보정을 적용하지 않고 사용합니다. 파랑일수 산정에는 대상 해역의 특성과 보정·검토 결과가 반영된 장기파랑 검토서(PDF) 자료 사용을 권장합니다.")
-            st.caption(f"적용 자료원: **{wave_manual_status.get('source_mode', wave_source_mode)}**")
-
-            if wave_source_mode == "WINK 관측파랑 자동조회":
-                if not wave_occurrence_display.empty and wave_occurrence_status.get("ok"):
-                    st.caption(
-                        "WINK 시간별 원시 유의파고·주기를 앱에서 직접 재분류한 파고×주기 계급별 출현회수 표입니다. "
-                        "사석공 Hs≥0.8m는 실제 관측값에서 직접 판정합니다."
-                    )
-                    st.dataframe(wave_occurrence_display, use_container_width=True, hide_index=True)
-                    rate = wave_manual_status.get("occurrence_rate_pct")
-                    annual_days = wave_manual_status.get("annual_days")
-                    monthly_days = wave_manual_status.get("monthly_days")
-                    if pd.notna(rate) and pd.notna(annual_days):
-                        c1, c2, c3 = st.columns(3)
-                        c1.metric("적용 파랑 출현율", f"{float(rate):.1f}%")
-                        c2.metric("연간 파랑 비작업일수", f"{float(annual_days):.2f}일")
-                        c3.metric("월 균등배분", f"{float(monthly_days if pd.notna(monthly_days) else annual_days/12):.2f}일/월")
-                        if "DCM" not in str(wave_criterion):
-                            st.caption(
-                                f"정확계산: WINK 원시자료에서 Hs≥0.8m 실제 회수를 집계 → "
-                                f"출현율 {float(rate):.4f}% × 365 = {float(annual_days):.2f}일/년 → ÷12 = {float(annual_days)/12:.2f}일/월"
-                            )
-                        else:
-                            st.caption(
-                                f"정확계산: WINK 원시자료에서 DCM 기준 충족 회수를 직접 판정 → "
-                                f"출현율 {float(rate):.4f}% × 365 = {float(annual_days):.2f}일/년 → ÷12 = {float(annual_days)/12:.2f}일/월"
-                            )
-                    if isinstance(wave_manual_status.get("year_status"), pd.DataFrame) and not wave_manual_status["year_status"].empty:
-                        with st.expander("WINK 연도별 원시자료 조회상태", expanded=False):
-                            st.dataframe(wave_manual_status["year_status"], use_container_width=True, hide_index=True)
-                else:
-                    st.warning("WINK 원시 파랑자료가 없습니다. 자동조회 상태를 확인하세요.")
-                    if wave_manual_status.get("message"):
-                        st.caption(wave_manual_status.get("message"))
-            else:
-                if wave_manual_status.get("ok"):
-                    pdf_result = wave_manual_status.get("pdf_result") or {}
-                    _frequency = pdf_result.get("frequency_table")
-                    if _frequency:
-                        st.markdown("#### 파고 × 주기별 출현빈도 (회)")
-                        _display = _wave_table_display(_frequency)
-                        _mask = pdf_result["mask"]
-                        def _highlight_wave_cells(frame):
-                            styles = pd.DataFrame("", index=frame.index, columns=frame.columns)
-                            for i in range(_mask.shape[0]):
-                                for j in range(_mask.shape[1]):
-                                    if _mask[i,j]:
-                                        styles.iloc[i,j] = "background-color: #fff0b3; color: #202020"
-                            return styles
-                        st.dataframe(_display.style.apply(_highlight_wave_cells, axis=None).format(precision=2, na_rep=""), use_container_width=True)
-                        st.caption(f"노란색: 적용 기준 해당 계급 · {pdf_result['count']:,.0f}회 / 전체 {_frequency['total']:,.0f}회 · {wave_criterion}")
-                        st.markdown("#### 선택한 표 기준 파랑 작업일수 산정")
-                        st.metric("파랑만 고려한 연간 작업가능일수", f"{365-pdf_result['annual_days']:.2f}일/년")
-                        st.caption("선택한 표의 전체 횟수를 분모로 출현율 × 365일을 환산한 추정값입니다. 특정 파향 표의 비율은 해당 파향 범위 내 비율입니다. 월별 값은 실제 월별 집계가 아닌 균등배분입니다.")
-                        if pdf_result.get("reported_results"):
-                            with st.expander("PDF 본문 요약값과 비교"):
-                                st.dataframe(pd.DataFrame(pdf_result["reported_results"]), hide_index=True)
-                                st.caption("본문의 반올림값·적용 범위가 다를 수 있습니다. 현재 계산은 선택한 표의 출현횟수를 사용합니다.")
-                    else:
-                        st.info("분류표를 검증하지 못해 PDF 본문 요약 일수만 적용했습니다.")
-                    annual_days = wave_manual_status.get("annual_days")
-                    monthly_days = wave_manual_status.get("monthly_days")
-                    rate = wave_manual_status.get("occurrence_rate_pct")
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("PDF 산정 출현율", f"{float(rate):.2f}%" if pd.notna(rate) else "-")
-                    c2.metric("연간 파랑 비작업일수", f"{float(annual_days):.2f}일" if pd.notna(annual_days) else "-")
-                    c3.metric("월 균등배분", f"{float(monthly_days):.2f}일/월" if pd.notna(monthly_days) else "-")
-                    st.caption(
-                        f"PDF 자동판독: {pdf_result.get('kind','-')} / PDF {pdf_result.get('page','-')}페이지 / "
-                        f"파일: {wave_manual_status.get('source_file','-')}"
-                    )
-                    if pdf_result.get("snippet"):
-                        with st.expander("PDF 적용 근거 원문", expanded=False):
-                            st.write(pdf_result.get("snippet"))
-                else:
-                    st.warning("장기파랑 PDF에서 적용 가능한 비작업일수 결과를 찾지 못했습니다.")
-                    if wave_manual_status.get("message"):
-                        st.caption(wave_manual_status.get("message"))
-
-            if wave_manual_status.get("ok"):
-                wave_month_table = pd.DataFrame({
-                    "월": [f"{m}월" for m in range(1, 13)],
-                    "파랑 비작업일수": [
-                        float(wave_month_avg.loc[m]) if pd.notna(wave_month_avg.loc[m]) else np.nan
-                        for m in range(1, 13)
-                    ],
-                })
-                wave_month_table.loc[len(wave_month_table)] = ["합계", wave_month_table["파랑 비작업일수"].sum(min_count=1)]
-                wave_month_table["파랑 비작업일수"] = pd.to_numeric(wave_month_table["파랑 비작업일수"], errors="coerce").round(2)
-                st.markdown("#### 월별 파랑 비작업일수")
-                st.dataframe(wave_month_table, use_container_width=True, hide_index=True)
-
-            st.markdown("---")
-            st.markdown("### 🌫️ 미세먼지·초미세먼지 경보 농도 기준 충족일수")
-            st.caption("PM10 ≥300 또는 PM2.5 ≥150㎍/㎥가 각각 2시간 연속인 날짜를 중복 제외하여 50% 적용합니다. 실제 발령 이력이 아닌 농도 기준 충족일 · 부분자료 적용 시 확인된 최소일수만 반영 · 진행 중인 월 제외")
-            if not pm10_monthly.empty:
-                st.caption(f"적용 측정소: {pm10_station_name} / {pm10_status.get('coverage','')}")
-                st.markdown("#### 확인된 경보 농도 기준 충족일수(중복 제외, 보정 전)")
-                st.dataframe(make_monthly_direct_pivot(pm10_monthly, "경보발령일수"), use_container_width=True, hide_index=True)
-                st.markdown("#### 적용 비작업일수(경보 농도 기준 충족일수 × 50%)")
-                st.dataframe(make_monthly_direct_pivot(pm10_monthly, "미세먼지_경보50퍼센트"), use_container_width=True, hide_index=True)
-                with st.expander("항목별·중복·일별 산정 근거"):
-                    st.dataframe(pm10_monthly, use_container_width=True, hide_index=True)
-                    st.dataframe(pm10_status.get('daily',pd.DataFrame()), use_container_width=True, hide_index=True)
-                    _evidence = pm10_status.get('hourly_evidence',pd.DataFrame())
-                    if not _evidence.empty:
-                        st.caption("기준 충족 시간과 바로 전 시간의 실제 농도(㎍/㎥)")
-                        _hits = _evidence['PM10연속2시간충족'] | _evidence['PM25연속2시간충족']
-                        st.dataframe(_evidence.loc[_hits], use_container_width=True, hide_index=True)
-
-                with st.expander("연도별 ZIP·측정자료 수집상태"):
-                    st.dataframe(pm10_status.get('year_status',pd.DataFrame()), use_container_width=True, hide_index=True)
-            else:
-                st.warning("판정 가능한 자료가 없습니다. ZIP 확보 및 측정소 자료 상태를 확인하세요.")
-
-    with tabs[7]:
-        period_defs = build_trailing_workday_windows(year_range[0], year_range[1])
-        period_tabs = st.tabs(
-            [
-                f"최근 {item['years']}년 ({item['start_year']}~{item['end_year']})"
-                for item in period_defs
-            ],
-            height="content",
-        )
-
-        for period_tab, period_def in zip(period_tabs, period_defs):
-            requested_years = int(period_def["years"])
-            period_result = workday_period_results.get(requested_years, {})
-            with period_tab:
-                period_start = int(period_def["start_year"])
-                period_end = int(period_def["end_year"])
-                available_span = period_end - period_start + 1
-                st.markdown(
-                    f"#### {requested_years}년치 자료를 사용한 작업가능일수"
-                )
-                st.caption(
-                    f"산정기간: **{period_start}~{period_end}** · "
-                    f"선택한 종료연도 {year_range[1]}년을 기준으로 최근 {requested_years}년"
-                )
-                if available_span < requested_years:
-                    st.warning(
-                        f"선택한 전체기간이 {requested_years}년보다 짧아 "
-                        f"{available_span}개년({period_start}~{period_end})만 사용합니다."
-                    )
-
-                if not period_result.get("ok"):
-                    st.warning(period_result.get("message", "해당 기간의 작업가능일수를 계산하지 못했습니다."))
-                    continue
-
-                actual_year_count = int(period_result.get("actual_year_count", 0))
-                if actual_year_count < available_span:
-                    actual_years = period_result.get("actual_years", [])
-                    actual_label = _compress_years(actual_years) if actual_years else "없음"
-                    st.warning(
-                        f"ASOS 실제 사용자료는 {actual_year_count}/{available_span}개년입니다: {actual_label}"
-                    )
-                else:
-                    st.caption(f"ASOS 실제 사용자료: {actual_year_count}개년")
-
-                st.subheader("📋 1.8.1 해상 작업 불가능일수")
-                st.dataframe(
-                    period_result["sea_df"],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                st.subheader("📋 1.8.2 육상 작업 불가능일수")
-                st.dataframe(
-                    period_result["land_df"],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                st.subheader("📋 1.8.3 법정 공휴일 수")
-                st.dataframe(
-                    period_result["holidays_df"],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                st.subheader("📋 1.8.4 기상 장애일수 (월 평균)")
-                st.dataframe(
-                    period_result["obs_avg_disp"],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                st.subheader("📋 1.8.5 비작업일수 종합 및 작업가능일수")
-                st.dataframe(
-                    period_result["final_df"],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                st.markdown("##### 🔸 최종 작업가능일수 및 가동율")
-                st.dataframe(
-                    period_result["summary_df"],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-    with tabs[8]:
-        st.markdown("#### 📘 기준 보고서와 동일한 서식으로 다운로드")
-        st.caption(
-            "보내주신 기준 Excel의 폰트, 글자 크기, 행·열 크기, 배경색, 테두리, "
-            "병합셀, 차트와 인쇄 설정을 유지하고 현재 조회 결과만 입력합니다."
-        )
-
-        template_bytes = _report_embedded_template_bytes()
-
-        formatted_report_bytes = None
-        if template_bytes:
-            try:
-                report_start_year = max(int(year_range[0]), int(year_range[1]) - 29)
-                report_end_year = int(year_range[1])
-                report_old = calculate_workday_period_result(
-                    df_daily=df_daily,
-                    df_monthly=df_monthly,
-                    pm10_monthly=pm10_monthly,
-                    wave_month_avg=wave_month_avg,
-                    holidays_df=holidays_df,
-                    mode="기존",
-                    start_year=report_start_year,
-                    end_year=report_end_year,
-                )
-                report_revised = calculate_workday_period_result(
-                    df_daily=df_daily,
-                    df_monthly=df_monthly,
-                    pm10_monthly=pm10_monthly,
-                    wave_month_avg=wave_month_avg,
-                    holidays_df=holidays_df,
-                    mode="개정",
-                    start_year=report_start_year,
-                    end_year=report_end_year,
-                )
-
-                old_sea_for_report = report_old.get("sea_df", sea_old_df) if report_old.get("ok") else sea_old_df
-                old_land_for_report = report_old.get("land_df", land_old_df) if report_old.get("ok") else land_old_df
-                old_obs_for_report = report_old.get("obs_avg_disp", obs_avg_old_disp) if report_old.get("ok") else obs_avg_old_disp
-                old_final_for_report = report_old.get("final_df", final_old_df) if report_old.get("ok") else final_old_df
-                old_summary_for_report = report_old.get("summary_df", summary_old_df) if report_old.get("ok") else summary_old_df
-
-                rev_sea_for_report = report_revised.get("sea_df", sea_rev_df) if report_revised.get("ok") else sea_rev_df
-                rev_land_for_report = report_revised.get("land_df", land_rev_df) if report_revised.get("ok") else land_rev_df
-                rev_obs_for_report = report_revised.get("obs_avg_disp", rev_obs_disp) if report_revised.get("ok") else rev_obs_disp
-                rev_final_for_report = report_revised.get("final_df", final_rev_df) if report_revised.get("ok") else final_rev_df
-                rev_summary_for_report = report_revised.get("summary_df", summary_rev_df) if report_revised.get("ok") else summary_rev_df
-
-                report_windrose_hourly, report_windrose_table, report_windrose_status = resolve_shared_windrose(
-                    station_code, station_name, report_start_year, report_end_year,
-                    windrose_data_source, api_key_daily)
-                formatted_report_bytes = build_formatted_report_xlsx(
-                    template_bytes=template_bytes,
-                    station_name=station_name,
-                    start_year=report_start_year,
-                    end_year=report_end_year,
-                    tables=tables,
-                    holidays_df=holidays_df,
-                    sea_old_df=old_sea_for_report,
-                    land_old_df=old_land_for_report,
-                    obs_avg_old_disp=old_obs_for_report,
-                    final_old_df=old_final_for_report,
-                    summary_old_df=old_summary_for_report,
-                    sea_rev_df=rev_sea_for_report,
-                    land_rev_df=rev_land_for_report,
-                    rev_obs_disp=rev_obs_for_report,
-                    final_rev_df=rev_final_for_report,
-                    summary_rev_df=rev_summary_for_report,
-                    pm10_monthly=pm10_monthly,
-                    pm10_status=pm10_status,
-                    wave_status=wave_manual_status,
-                    wave_display=wave_occurrence_display,
-                    wave_criterion=wave_criterion,
-                    windrose_table=report_windrose_table,
-                    windrose_status=report_windrose_status,
-                    windrose_hourly=report_windrose_hourly,
-                )
-            except Exception as exc:
-                st.error(f"기준 서식 Excel 생성 중 오류가 발생했습니다: {exc}")
-
-        if formatted_report_bytes:
-            st.download_button(
-                label=f"📥 {station_name} 기준서식 보고서 다운로드 (.xlsx)",
-                data=_rx_excel_bytes(formatted_report_bytes),
-                file_name=(
-                    f"{station_name}_{report_start_year}_{report_end_year}_"
-                    "기초자료조사_기준서식.xlsx"
-                ),
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-                on_click="ignore",
-            )
-
-        st.divider()
-        st.markdown("#### 📊 원자료형 Excel 다운로드")
-        st.caption("화면에 표시된 전체 계산표를 시트별 원자료 형태로 저장합니다.")
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            for sn, tdf in tables.items():
-                tdf.to_excel(writer, sheet_name=sn[:31], index=False)
-            df_monthly.to_excel(writer, sheet_name="기후통계_안개뇌전결빙", index=False)
-            holidays_df.to_excel(writer, sheet_name="법정공휴일수", index=False)
-
-            criteria_old_df.to_excel(writer, sheet_name="기존_산정기준", index=False)
-            sea_old_df.to_excel(writer, sheet_name="기존_해상불가능", index=False)
-            land_old_df.to_excel(writer, sheet_name="기존_육상불가능", index=False)
-            obs_avg_old_disp.to_excel(writer, sheet_name="기존_기상장애", index=False)
-            final_old_df.to_excel(writer, sheet_name="기존_비작업종합", index=False)
-            summary_old_df.to_excel(writer, sheet_name="기존_최종가동율", index=False)
-
-            criteria_rev_df.to_excel(writer, sheet_name="개정_산정기준", index=False)
-            sea_rev_df.to_excel(writer, sheet_name="개정_해상불가능", index=False)
-            land_rev_df.to_excel(writer, sheet_name="개정_육상불가능", index=False)
-            rev_obs_disp.to_excel(writer, sheet_name="개정_기상현상", index=False)
-            final_rev_df.to_excel(writer, sheet_name="개정_비작업종합", index=False)
-            summary_rev_df.to_excel(writer, sheet_name="개정_최종가동율", index=False)
-
-            period_export_rows = []
-            for period_years in (10, 20, 30):
-                period_result = workday_period_results.get(period_years, {})
-                if not period_result.get("ok"):
-                    continue
-                sheet_prefix = f"{period_years}년_{workday_mode}"
-                period_result["sea_df"].to_excel(
-                    writer,
-                    sheet_name=f"{sheet_prefix}_해상불가"[:31],
-                    index=False,
-                )
-                period_result["land_df"].to_excel(
-                    writer,
-                    sheet_name=f"{sheet_prefix}_육상불가"[:31],
-                    index=False,
-                )
-                period_result["obs_avg_disp"].to_excel(
-                    writer,
-                    sheet_name=f"{sheet_prefix}_기상장애"[:31],
-                    index=False,
-                )
-                period_result["final_df"].to_excel(
-                    writer,
-                    sheet_name=f"{sheet_prefix}_비작업종합"[:31],
-                    index=False,
-                )
-                period_result["summary_df"].to_excel(
-                    writer,
-                    sheet_name=f"{sheet_prefix}_최종가동율"[:31],
-                    index=False,
-                )
-                period_export_rows.append(
-                    {
-                        "구분": f"최근 {period_years}년",
-                        "산정시작연도": period_result.get("start_year"),
-                        "산정종료연도": period_result.get("end_year"),
-                        "ASOS실제사용연도수": period_result.get("actual_year_count"),
-                        "ASOS실제사용연도": _compress_years(period_result.get("actual_years", [])),
-                    }
-                )
-            if period_export_rows:
-                pd.DataFrame(period_export_rows).to_excel(
-                    writer,
-                    sheet_name="기간별_작업일수_산정범위",
-                    index=False,
-                )
-
-            wave_manual_export = pd.DataFrame({
-                "월": list(range(1, 13)),
-                "파랑_비작업일수": wave_month_avg.values,
-            })
-            wave_manual_export.to_excel(writer, sheet_name="개정_파랑월평균", index=False)
-            if wave_manual_status.get("ok") and isinstance(wave_manual_status.get("matrix"), pd.DataFrame):
-                _mx = wave_manual_status["matrix"].copy()
-                _mx.index.name = "주기계급"
-                _mx.reset_index().to_excel(writer, sheet_name="개정_WINK출현율표", index=False)
-            if wave_manual_status.get("ok") and isinstance(wave_manual_status.get("used_cells"), pd.DataFrame) and not wave_manual_status["used_cells"].empty:
-                wave_manual_status["used_cells"].to_excel(writer, sheet_name="개정_WINK기준반영셀", index=False)
-            if wave_manual_status.get("ok") and isinstance(wave_manual_status.get("monthly_detail"), pd.DataFrame):
-                wave_manual_status["monthly_detail"].to_excel(writer, sheet_name="개정_WINK파랑연월상세", index=False)
-            if workday_mode == "개정" and wave_source_mode == "WINK 관측파랑 자동조회" and wink_collect_result.get("ok"):
-                _wink_download_info = pd.DataFrame([{
-                    "지점": wink_station_name,
-                    "자료유형": "WINK 관측 원시 유의파고·주기",
-                    "전체자료_시작": wink_collect_result.get("coverage_start"),
-                    "전체자료_종료": wink_collect_result.get("coverage_end"),
-                    "다운로드파일": wink_collect_result.get("filename", ""),
-                    "자료원": wink_collect_result.get("source_mode", ""),
-                }])
-                _wink_download_info.to_excel(writer, sheet_name="개정_WINK원시자료정보", index=False)
-            if not wave_occurrence_display.empty:
-                wave_occurrence_display.to_excel(writer, sheet_name="개정_파랑계급별출현", index=False)
-            _wave_month_export = pd.DataFrame({
-                "월": [f"{m}월" for m in range(1, 13)],
-                "파랑비작업일수": [float(wave_month_avg.loc[m]) if pd.notna(wave_month_avg.loc[m]) else np.nan for m in range(1, 13)],
-            })
-            _wave_month_export.loc[len(_wave_month_export)] = ["합계", _wave_month_export["파랑비작업일수"].sum(min_count=1)]
-            _wave_month_export.to_excel(writer, sheet_name="개정_파랑비작업일수", index=False)
-            if workday_mode == "개정" and wave_source_mode == "장기파랑 PDF" and wave_manual_status.get("ok"):
-                _pdf_r = wave_manual_status.get("pdf_result") or {}
-                if _pdf_r.get("frequency_table"):
-                    _wave_table_display(_pdf_r["frequency_table"]).to_excel(writer, sheet_name="PDF_파고주기_출현빈도")
-
-                pd.DataFrame([{
-                    "자료원": wave_manual_status.get("source_mode", "장기파랑 PDF"),
-                    "파일명": wave_manual_status.get("source_file", ""),
-                    "적용공종": _pdf_r.get("kind", ""),
-                    "PDF페이지": _pdf_r.get("page", ""),
-                    "연간비작업일수": wave_manual_status.get("annual_days"),
-                    "출현율_pct": wave_manual_status.get("occurrence_rate_pct"),
-                    "근거문구": _pdf_r.get("snippet", ""),
-                }]).to_excel(writer, sheet_name="개정_장기파랑PDF정보", index=False)
-            if not pm10_monthly.empty:
-                pm10_monthly.to_excel(writer, sheet_name="개정_미세먼지월별", index=False)
-                make_monthly_direct_pivot(pm10_monthly, "미세먼지_경보50퍼센트").to_excel(writer, sheet_name="개정_미세먼지50%일수", index=False)
-                make_monthly_direct_pivot(pm10_monthly, "경보발령일수").to_excel(writer, sheet_name="개정_농도기준충족일수", index=False)
-                if isinstance(pm10_status.get("alarm_records"), pd.DataFrame) and not pm10_status["alarm_records"].empty:
-                    pm10_status["alarm_records"].to_excel(writer, sheet_name="개정_경보발령원본", index=False)
-                if isinstance(pm10_status.get("daily"), pd.DataFrame) and not pm10_status["daily"].empty:
-                    pm10_status["daily"].to_excel(writer, sheet_name="개정_농도기준일별판정", index=False)
-                if isinstance(pm10_status.get("year_status"), pd.DataFrame) and not pm10_status["year_status"].empty:
-                    pm10_status["year_status"].to_excel(writer, sheet_name="개정_ZIP연도별수집", index=False)
-
-            if not windrose_occurrence_table.empty:
-                windrose_occurrence_table.to_excel(writer, sheet_name="계급별 관측백분율", index=False)
-
-            pd.DataFrame({
-                "설정": [
-                    "작업일수 산정 모드", "관측지점", "조회기간",
-                    "파랑 기준", "파랑 자료원 방식", "파랑 적용기간/근거", "WINK 파랑 관측지점", "파랑 자료파일/자료원",
-                    "환산 연간 파랑 비작업일수", "미세먼지 자료원", "미세먼지 분석기간", "경보 지역·권역", "경보 적용계수", "경보 기준", "집계 방식"
-                ],
-                "값": [
-                    workday_mode, station_name, f"{year_range[0]}~{year_range[1]}",
-                    wave_criterion, wave_source_mode, (wave_manual_status.get("coverage") or (f"{wink_year_range[0]}~{wink_year_range[1]}" if wave_source_mode == "WINK 관측파랑 자동조회" else "PDF 자동판독")), wink_station_name if wave_source_mode == "WINK 관측파랑 자동조회" else "", wave_manual_status.get("source_file") or wink_source_name,
-                    wave_manual_status.get("annual_days"), "에어코리아 최종확정 ZIP 시간농도 자료", f"{pm10_year_range[0]}–{pm10_year_range[1]}", pm10_station_name, 0.5, "PM10≥300 또는 PM2.5≥150 각각 연속 2시간", "경보 농도 기준 충족일 합집합 × 50%"
-                ]
-            }).to_excel(writer, sheet_name="산정설정", index=False)
-
-        st.download_button(
-            label=f"📄 {station_name} 원자료형 종합 분석 다운로드 (.xlsx)",
-            data=_rx_excel_bytes(output.getvalue()),
-            file_name=f"{station_name}_{workday_mode}_작업일수_종합분석.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            on_click="ignore",
-        )
-
+_saved_display = st.session_state.get('_workday_display_v1')
+if _saved_display:
+    if not _run_requested:
+        st.info('이전 계산 결과를 표시합니다. 설정을 바꿨다면 「데이터 수집 및 엑셀 생성」을 눌러 갱신하세요.')
+    _render_saved_workday_result(**_saved_display['inputs'],
+        _render_cache=_saved_display['render_cache'], api_key_daily=api_key_daily)
 
 # 페이지 최하단 여유 공간: 긴 탭/데이터프레임 렌더링 시 마지막 영역 잘림 방지
 st.markdown("<div style='height:120px'></div>", unsafe_allow_html=True)
